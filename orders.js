@@ -26,6 +26,7 @@ let isSyncing       = false;
 // Chatbot Server sync state
 let serverApiUrl        = 'http://localhost:5000';
 let isServerSyncEnabled = false;
+let isKeepOnServerEnabled = true; // Default to true for test mode
 let serverSyncTimer     = null;
 
 // ─────────────────────────────────────────────
@@ -40,6 +41,7 @@ const K_SYNCSTATS = 'messenger_syncstats';
 const K_FNAME     = 'messenger_filename';
 const K_SERVER_URL  = 'chatbot_server_url';
 const K_SERVER_SYNC = 'chatbot_server_sync_enabled';
+const K_SERVER_KEEP = 'chatbot_server_keep_on_server';
 
 // ─────────────────────────────────────────────
 // DEFAULT KEYWORDS (Portuguese order terms)
@@ -83,6 +85,7 @@ function loadData() {
 
   serverApiUrl = localStorage.getItem(K_SERVER_URL) || 'http://localhost:5000';
   isServerSyncEnabled = localStorage.getItem(K_SERVER_SYNC) === 'true';
+  isKeepOnServerEnabled = localStorage.getItem(K_SERVER_KEEP) !== 'false'; // defaults to true
 
   // Back-fill sequence numbers
   orders.forEach(o => { if (!o.seq) { orderCounter++; o.seq = orderCounter; } });
@@ -98,6 +101,7 @@ function saveData() {
   localStorage.setItem(K_SYNCSTATS, JSON.stringify(syncStats));
   localStorage.setItem(K_SERVER_URL,  serverApiUrl);
   localStorage.setItem(K_SERVER_SYNC, String(isServerSyncEnabled));
+  localStorage.setItem(K_SERVER_KEEP, String(isKeepOnServerEnabled));
 }
 
 // ─────────────────────────────────────────────
@@ -1136,10 +1140,20 @@ function initServerSync() {
   const input = document.getElementById('server-api-url');
   if (input) input.value = serverApiUrl;
   
+  const keepCheck = document.getElementById('server-keep-messages');
+  if (keepCheck) keepCheck.checked = isKeepOnServerEnabled;
+  
   updateServerSyncUI();
   if (isServerSyncEnabled) {
     startServerSyncLoop();
   }
+}
+
+function toggleKeepOnServer() {
+  const keepCheck = document.getElementById('server-keep-messages');
+  isKeepOnServerEnabled = keepCheck ? keepCheck.checked : true;
+  saveData();
+  showToast(isKeepOnServerEnabled ? '💾 Cópia no servidor activada (Modo Teste)' : '🗑️ Mensagens serão apagadas do servidor ao sincronizar');
 }
 
 function startServerSyncLoop() {
@@ -1232,13 +1246,16 @@ async function syncWithServer() {
     for (const item of serverOrders) {
       const key = dedupKey(item);
       if (existingKeys.has(key) || existingIds.has(item.id)) {
-        // Já existe localmente, tentar limpar do servidor
-        await deleteOrderFromServer(item.id);
+        // Já existe localmente, tentar limpar do servidor se não for para manter
+        if (!isKeepOnServerEnabled) {
+          await deleteOrderFromServer(item.id);
+        }
         continue;
       }
       
       const obj = {
         id:              item.id,
+        senderId:        item.senderId || '',
         name:            item.name,
         message:         item.message,
         receivedAt:      item.receivedAt,
@@ -1255,8 +1272,10 @@ async function syncWithServer() {
       }
       
       newImported++;
-      // Remover do servidor já que foi importado com sucesso
-      await deleteOrderFromServer(item.id);
+      // Remover do servidor apenas se o modo de testes/manutenção estiver desligado
+      if (!isKeepOnServerEnabled) {
+        await deleteOrderFromServer(item.id);
+      }
     }
     
     if (newImported > 0) {
