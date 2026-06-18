@@ -1,0 +1,553 @@
+<!DOCTYPE html>
+<html lang="pt">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+  <meta name="description" content="Gestão de encomendas recebidas via Facebook Messenger da sua Página de negócios." />
+  <meta name="theme-color" content="#6366f1" />
+  <meta name="mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <meta name="apple-mobile-web-app-title" content="Encomendas" />
+  <title>Encomendas — Messenger da Página</title>
+  <link rel="manifest" href="manifest.json" />
+  <link rel="stylesheet" href="orders.css" />
+</head>
+<body>
+
+<div class="app">
+
+  <!-- ═══════════════════════════════════════
+       SIDEBAR (tablet/desktop)
+  ════════════════════════════════════════ -->
+  <nav class="sidebar" id="sidebar">
+    <div class="sidebar-logo">📦</div>
+
+    <button class="nav-btn active" id="nav-queue"   onclick="showSection('queue')"   title="Fila de Triagem">
+      <span>🗂️</span><span class="nav-label">Fila</span>
+      <span class="nav-badge" id="badge-pending" style="display:none">0</span>
+    </button>
+    <button class="nav-btn" id="nav-history"  onclick="showSection('history')"  title="Histórico">
+      <span>📋</span><span class="nav-label">Histórico</span>
+    </button>
+    <button class="nav-btn" id="nav-review"   onclick="showSection('review')"   title="Para Rever">
+      <span>🔎</span><span class="nav-label">Rever</span>
+      <span class="nav-badge nav-badge-amber" id="badge-review" style="display:none">0</span>
+    </button>
+    <button class="nav-btn" id="nav-import"   onclick="showSection('import')"   title="Importar">
+      <span>📥</span><span class="nav-label">Importar</span>
+    </button>
+    <button class="nav-btn" id="nav-replies"  onclick="showSection('replies')"  title="Respostas">
+      <span>💬</span><span class="nav-label">Respostas</span>
+    </button>
+    <button class="nav-btn" id="nav-settings" onclick="showSection('settings')" title="Configurações">
+      <span>⚙️</span><span class="nav-label">Config</span>
+    </button>
+  </nav>
+
+  <!-- ═══════════════════════════════════════
+       MAIN
+  ════════════════════════════════════════ -->
+  <div class="main">
+
+    <!-- TOPBAR -->
+    <div class="topbar">
+      <div>
+        <div class="topbar-title" id="topbar-title">🗂️ Fila de Triagem</div>
+        <div class="topbar-subtitle" id="topbar-sub">Encomendas por ordem de chegada</div>
+      </div>
+      <div class="topbar-actions">
+        <!-- Sync status pill -->
+        <div class="sync-pill" id="sync-pill" onclick="showSection('settings')" title="Estado da sincronização">
+          <span class="sync-dot" id="sync-dot"></span>
+          <span id="sync-label">Desligado</span>
+        </div>
+        <button class="btn btn-ghost btn-sm" onclick="exportCSV()">⬇ CSV</button>
+        <button class="btn btn-primary btn-sm" onclick="manualSync()">🔄 Sync</button>
+      </div>
+    </div>
+
+    <!-- SYNC STATUS BAR (shown when connected) -->
+    <div class="sync-bar" id="sync-bar" style="display:none">
+      <span id="sync-bar-text">🔄 A sincronizar...</span>
+      <span id="sync-bar-new" class="sync-bar-new" style="display:none"></span>
+    </div>
+
+    <!-- STATS -->
+    <div class="stats-bar" id="stats-bar">
+      <div class="stat-pill pending">
+        <span class="stat-num" id="stat-pending">0</span>
+        <span class="stat-lbl">🟡 Pendentes</span>
+      </div>
+      <div class="stat-pill review-stat">
+        <span class="stat-num" id="stat-review">0</span>
+        <span class="stat-lbl">🔎 Para rever</span>
+      </div>
+      <div class="stat-pill confirmed">
+        <span class="stat-num" id="stat-confirmed">0</span>
+        <span class="stat-lbl">🟢 Confirmadas</span>
+      </div>
+      <div class="stat-pill no-stock">
+        <span class="stat-num" id="stat-nostock">0</span>
+        <span class="stat-lbl">🔴 Sem stock</span>
+      </div>
+    </div>
+
+    <!-- FILTER TABS -->
+    <div class="filter-bar" id="filter-bar">
+      <button class="filter-tab active" id="ftab-all"        onclick="setFilter('all')">Todas</button>
+      <button class="filter-tab"        id="ftab-pendente"   onclick="setFilter('pendente')">🟡 Pendentes</button>
+      <button class="filter-tab"        id="ftab-analise"    onclick="setFilter('analise')">🔵 Em Análise</button>
+      <button class="filter-tab"        id="ftab-confirmada" onclick="setFilter('confirmada')">🟢 Confirmadas</button>
+      <button class="filter-tab"        id="ftab-sem-stock"  onclick="setFilter('sem-stock')">🔴 Sem Stock</button>
+    </div>
+
+    <!-- CONTENT -->
+    <div class="content">
+
+      <!-- ══════ SECTION: QUEUE ══════ -->
+      <section class="section active" id="section-queue">
+        <div class="search-wrap">
+          <span class="search-icon">🔍</span>
+          <input class="search-input" id="queue-search" type="search"
+                 placeholder="Pesquisar por nome ou mensagem..."
+                 oninput="renderQueue()" />
+        </div>
+        <div class="orders-list" id="orders-list"></div>
+        <div class="empty" id="empty-queue" style="display:none">
+          <div class="empty-icon">📭</div>
+          <h2>Sem encomendas aqui</h2>
+          <p>Quando o MacroDroid detectar mensagens com palavras-chave de encomenda, aparecerão aqui automaticamente.</p>
+          <button class="btn btn-primary" onclick="showSection('settings')">⚙️ Configurar Auto-Sync</button>
+        </div>
+      </section>
+
+      <!-- ══════ SECTION: HISTORY ══════ -->
+      <section class="section" id="section-history">
+        <h1 class="section-title">📋 Histórico</h1>
+        <p class="section-sub">Encomendas confirmadas e recusadas</p>
+        <div class="search-wrap">
+          <span class="search-icon">🔍</span>
+          <input class="search-input" id="history-search" type="search"
+                 placeholder="Pesquisar histórico..." oninput="renderHistory()" />
+        </div>
+        <div style="overflow-x:auto">
+          <table class="history-table">
+            <thead>
+              <tr>
+                <th>#</th><th>Nome</th><th>Mensagem</th><th>Estado</th><th>Data</th><th>Ações</th>
+              </tr>
+            </thead>
+            <tbody id="history-tbody"></tbody>
+          </table>
+        </div>
+        <div class="empty" id="empty-history" style="display:none">
+          <div class="empty-icon">📋</div>
+          <h2>Histórico vazio</h2>
+          <p>As encomendas processadas aparecem aqui.</p>
+        </div>
+      </section>
+
+      <!-- ══════ SECTION: REVIEW (mensagens sem palavras-chave) ══════ -->
+      <section class="section" id="section-review">
+        <h1 class="section-title">🔎 Para Rever</h1>
+        <p class="section-sub">Mensagens capturadas pelo MacroDroid que não corresponderam a nenhuma palavra-chave de encomenda. Reveja e decida se são encomendas.</p>
+        <div class="orders-list" id="review-list"></div>
+        <div class="empty" id="empty-review" style="display:none">
+          <div class="empty-icon">✅</div>
+          <h2>Tudo tratado!</h2>
+          <p>Não há mensagens para rever.</p>
+        </div>
+      </section>
+
+      <!-- ══════ SECTION: IMPORT ══════ -->
+      <section class="section" id="section-import">
+        <div class="import-section">
+          <h1 class="section-title">📥 Importar Manualmente</h1>
+          <p class="section-sub">Para importar um ficheiro JSON pontual ou adicionar manualmente</p>
+
+          <div class="import-card">
+            <h3>📄 Importar Ficheiro JSON</h3>
+            <p>Seleccione um ficheiro JSON exportado pelo bookmarklet ou pelo MacroDroid.</p>
+            <div class="drop-zone" id="json-drop"
+                 ondragover="event.preventDefault();this.classList.add('drag-over')"
+                 ondragleave="this.classList.remove('drag-over')"
+                 ondrop="handleFileDrop(event)">
+              <div class="drop-icon">📂</div>
+              <p>Arraste o ficheiro <strong>orders_import.json</strong> aqui</p>
+              <p style="font-size:12px;margin-top:4px">ou</p>
+              <label class="btn btn-primary btn-sm" style="margin-top:8px" for="file-json">Seleccionar Ficheiro</label>
+              <input type="file" id="file-json" accept=".json,.txt" style="display:none" onchange="handleFileInput(event)" />
+            </div>
+          </div>
+
+          <div class="import-card">
+            <h3>✏️ Adicionar Manualmente</h3>
+            <p>Adicione uma encomenda copiando a informação directamente do Messenger.</p>
+            <div class="manual-form">
+              <div class="form-row">
+                <div class="form-group">
+                  <label>Nome do Cliente *</label>
+                  <input type="text" id="m-name" class="form-input" placeholder="Ex: Ana Silva" />
+                </div>
+                <div class="form-group">
+                  <label>Data/Hora de Chegada</label>
+                  <input type="datetime-local" id="m-time" class="form-input" />
+                </div>
+              </div>
+              <div class="form-group">
+                <label>Mensagem / Encomenda *</label>
+                <textarea id="m-msg" class="form-input" rows="3"
+                          placeholder="Cole aqui o texto da mensagem do Messenger..."></textarea>
+              </div>
+              <div class="form-row">
+                <div class="form-group">
+                  <label>Produto(s)</label>
+                  <input type="text" id="m-product" class="form-input" placeholder="Ex: T-shirt azul M" />
+                </div>
+                <div class="form-group">
+                  <label>Link da Conversa (opcional)</label>
+                  <input type="url" id="m-url" class="form-input" placeholder="https://..." />
+                </div>
+              </div>
+              <button class="btn btn-primary" onclick="addManual()">➕ Adicionar Encomenda</button>
+            </div>
+          </div>
+
+          <div class="import-card" style="border-color:rgba(244,63,94,0.3)">
+            <h3>⚠️ Zona de Perigo</h3>
+            <p>Elimina todas as encomendas guardadas. Não pode ser desfeito.</p>
+            <button class="btn btn-danger" onclick="confirmClearAll()">🗑️ Limpar Tudo</button>
+          </div>
+        </div>
+      </section>
+
+      <!-- ══════ SECTION: REPLIES ══════ -->
+      <section class="section" id="section-replies">
+        <div class="templates-section">
+          <h1 class="section-title">💬 Respostas Rápidas</h1>
+          <p class="section-sub">Use <code style="background:var(--bg);padding:2px 6px;border-radius:4px;font-size:12px;color:var(--indigo)">{nome}</code> para o nome do cliente.</p>
+          <div id="templates-list"></div>
+          <button class="btn btn-ghost" onclick="addTemplate()">+ Adicionar Template</button>
+        </div>
+      </section>
+
+      <!-- ══════ SECTION: SETTINGS ══════ -->
+      <section class="section" id="section-settings">
+        <div class="import-section">
+          <h1 class="section-title">⚙️ Configurações</h1>
+          <p class="section-sub">Auto-sync com MacroDroid e palavras-chave de detecção</p>
+
+          <!-- AUTO-SYNC CARD -->
+          <div class="import-card sync-connect-card" id="sync-connect-card">
+            <div class="sync-connect-header">
+              <div>
+                <h3>🤖 Auto-Sync com MacroDroid</h3>
+                <p id="sync-connect-desc">Ligue o ficheiro que o MacroDroid escreve para sincronizar encomendas automaticamente a cada 30 segundos.</p>
+              </div>
+              <div class="sync-status-badge" id="sync-status-badge">
+                <span class="sync-dot"></span>
+                <span id="sync-status-text">Desligado</span>
+              </div>
+            </div>
+
+            <div id="sync-disconnected-ui">
+              <div class="info-box" style="margin-bottom:14px">
+                <strong>Como funciona:</strong> O MacroDroid escreve cada notificação do Messenger num ficheiro JSON no seu dispositivo. Esta app lê esse ficheiro automaticamente e detecta encomendas.
+              </div>
+              <button class="btn btn-primary" onclick="connectMacroDroid()">
+                📂 Seleccionar Ficheiro do MacroDroid
+              </button>
+            </div>
+
+            <div id="sync-connected-ui" style="display:none">
+              <div class="sync-connected-info">
+                <div class="sync-file-row">
+                  <span>📄</span>
+                  <div>
+                    <div class="sync-file-name" id="sync-file-name">—</div>
+                    <div class="sync-file-sub" id="sync-last-sync">Nunca sincronizado</div>
+                  </div>
+                </div>
+                <div class="sync-stats-row">
+                  <div class="sync-stat">
+                    <span class="sync-stat-num" id="ss-total">0</span>
+                    <span class="sync-stat-lbl">Lidas</span>
+                  </div>
+                  <div class="sync-stat">
+                    <span class="sync-stat-num" id="ss-orders">0</span>
+                    <span class="sync-stat-lbl">Encomendas</span>
+                  </div>
+                  <div class="sync-stat">
+                    <span class="sync-stat-num" id="ss-review">0</span>
+                    <span class="sync-stat-lbl">Para rever</span>
+                  </div>
+                </div>
+              </div>
+              <div style="display:flex;gap:8px;margin-top:14px;flex-wrap:wrap">
+                <button class="btn btn-primary" onclick="manualSync()">🔄 Sincronizar Agora</button>
+                <button class="btn btn-ghost" onclick="disconnectFile()">🔌 Desligar Ficheiro</button>
+              </div>
+            </div>
+          </div>
+
+          <!-- SERVER SYNC (CHATBOT API) CARD -->
+          <div class="import-card sync-connect-card" id="server-sync-card" style="margin-top: 14px;">
+            <div class="sync-connect-header">
+              <div>
+                <h3>🌐 Sincronização com o Chatbot (API)</h3>
+                <p>Configure a ligação com o servidor do Chatbot para importar encomendas recolhidas automaticamente.</p>
+              </div>
+              <div class="sync-status-badge" id="server-status-badge">
+                <span class="sync-dot" id="server-sync-dot"></span>
+                <span id="server-status-text">Desligado</span>
+              </div>
+            </div>
+
+            <div class="form-group" style="margin-top:14px; margin-bottom:14px;">
+              <label>URL do Servidor (API):</label>
+              <input type="url" id="server-api-url" class="form-input" placeholder="http://localhost:5000" />
+            </div>
+
+            <div style="display:flex;gap:8px;flex-wrap:wrap">
+              <button class="btn btn-primary" onclick="connectServerSync()">⚡ Activar Sincronização</button>
+              <button class="btn btn-ghost" onclick="disconnectServerSync()">🔌 Desligar Servidor</button>
+            </div>
+          </div>
+
+          <!-- KEYWORDS CARD -->
+          <div class="import-card">
+            <h3>🔑 Palavras-Chave de Encomenda</h3>
+            <p>Mensagens do Messenger que contenham estas palavras são automaticamente identificadas como encomendas. As restantes vão para "Para Rever".</p>
+
+            <div class="keywords-wrap" id="keywords-wrap">
+              <!-- Rendered by JS -->
+            </div>
+
+            <div style="display:flex;gap:8px;margin-top:12px">
+              <input type="text" id="new-keyword" class="form-input"
+                     placeholder="Nova palavra-chave (ex: encomendar)"
+                     onkeydown="if(event.key==='Enter')addKeyword()" />
+              <button class="btn btn-primary" onclick="addKeyword()">+ Adicionar</button>
+            </div>
+            <div style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap">
+              <button class="btn btn-ghost btn-sm" onclick="resetKeywords()">↩️ Repor predefinições</button>
+            </div>
+          </div>
+
+          <!-- MACRODROID GUIDE -->
+          <div class="import-card">
+            <h3>📱 Como Configurar o MacroDroid</h3>
+            <p>Siga estes passos para configurar o MacroDroid no seu telemóvel para capturar mensagens do Messenger automaticamente.</p>
+
+            <div class="guide-step-card" style="margin-top:12px">
+              <div class="guide-num">1</div>
+              <div class="guide-text">
+                <h4>Instalar MacroDroid</h4>
+                <p>Instale o <strong>MacroDroid</strong> gratuitamente na Play Store. Abra a app e aceite dar permissão de <strong>"Acesso a Notificações"</strong> (obrigatório).</p>
+              </div>
+            </div>
+
+            <div class="guide-step-card">
+              <div class="guide-num">2</div>
+              <div class="guide-text">
+                <h4>Criar nova Macro</h4>
+                <p>Toque em <strong>Macros → + (novo)</strong>. Dê o nome <em>"Capturar Encomendas Messenger"</em>.</p>
+              </div>
+            </div>
+
+            <div class="guide-step-card">
+              <div class="guide-num">3</div>
+              <div class="guide-text">
+                <h4>Configurar o Gatilho (Trigger)</h4>
+                <p>Adicione o gatilho: <strong>Eventos do dispositivo → Notificação recebida → Seleccionar app: Messenger</strong>. Deixe o conteúdo em "Qualquer".</p>
+              </div>
+            </div>
+
+            <div class="guide-step-card">
+              <div class="guide-num">4</div>
+              <div class="guide-text">
+                <h4>Configurar a Acção (escrever ficheiro)</h4>
+                <p>Adicione a acção: <strong>Ficheiros → Escrever para Ficheiro</strong>.</p>
+                <p style="margin-top:6px">Configure assim:</p>
+                <div class="macro-config">
+                  <div class="macro-row"><span class="macro-key">Nome do ficheiro:</span><code>encomendas_messenger.json</code></div>
+                  <div class="macro-row"><span class="macro-key">Modo:</span><code>Acrescentar (Append)</code></div>
+                  <div class="macro-row"><span class="macro-key">Conteúdo:</span></div>
+                  <div class="macro-template" id="macro-template-text">
+                    {"name":"{not_title}","message":"{not_text}","receivedAt":"{year}-{month}-{day}T{hour}:{mins}:{secs}.000Z"}
+                  </div>
+                  <button class="btn btn-ghost btn-sm" onclick="copyMacroTemplate()" style="margin-top:8px">📋 Copiar Template</button>
+                </div>
+                <div class="warning-box" style="margin-top:10px">
+                  <strong>⚠️ Importante:</strong> Coloque uma linha vazia antes de cada entrada. No MacroDroid, o campo "Conteúdo" deve começar com <code>\n</code> (nova linha).
+                </div>
+              </div>
+            </div>
+
+            <div class="guide-step-card">
+              <div class="guide-num">5</div>
+              <div class="guide-text">
+                <h4>Activar e Testar</h4>
+                <p>Guarde a macro e active-a. Envie uma mensagem de teste para a sua Página. O ficheiro <code>encomendas_messenger.json</code> é criado na pasta padrão de documentos do MacroDroid.</p>
+              </div>
+            </div>
+
+            <div class="guide-step-card">
+              <div class="guide-num">6</div>
+              <div class="guide-text">
+                <h4>Ligar o ficheiro a esta app</h4>
+                <p>No painel <strong>Auto-Sync</strong> acima, toque em "Seleccionar Ficheiro do MacroDroid" e escolha o ficheiro <code>encomendas_messenger.json</code>. A partir daí, a sincronização é automática!</p>
+              </div>
+            </div>
+          </div>
+
+          <!-- BOOKMARKLET GUIDE -->
+          <div class="import-card">
+            <h3>🔖 Bookmarklet (alternativa manual)</h3>
+            <p>Se preferir importar do browser em vez do MacroDroid, use o bookmarklet no Kiwi Browser.</p>
+            <div class="bookmarklet-wrap">
+              <a class="bookmarklet-btn" id="bookmarklet-link" href="#">📦 Importar Encomendas ← Arrastar para favoritos</a>
+            </div>
+            <button class="btn btn-ghost btn-sm" onclick="copyBookmarkletCode()">📋 Copiar Código (Android)</button>
+            <a class="btn btn-ghost btn-sm" href="bookmarklet.html" style="margin-left:8px">📖 Guia completo</a>
+          </div>
+
+        </div>
+      </section>
+
+    </div><!-- /content -->
+  </div><!-- /main -->
+
+  <!-- Mobile Bottom Nav -->
+  <nav class="mobile-nav" id="mobile-nav">
+    <button class="nav-btn active" id="mnav-queue"    onclick="showSection('queue')">
+      <span>🗂️</span><span class="nav-label">Fila</span>
+      <span class="nav-badge" id="mbadge-pending" style="display:none">0</span>
+    </button>
+    <button class="nav-btn" id="mnav-review"   onclick="showSection('review')">
+      <span>🔎</span><span class="nav-label">Rever</span>
+      <span class="nav-badge nav-badge-amber" id="mbadge-review" style="display:none">0</span>
+    </button>
+    <button class="nav-btn" id="mnav-import"   onclick="showSection('import')">
+      <span>📥</span><span class="nav-label">Importar</span>
+    </button>
+    <button class="nav-btn" id="mnav-replies"  onclick="showSection('replies')">
+      <span>💬</span><span class="nav-label">Respostas</span>
+    </button>
+    <button class="nav-btn" id="mnav-settings" onclick="showSection('settings')">
+      <span>⚙️</span><span class="nav-label">Config</span>
+    </button>
+  </nav>
+
+</div><!-- /app -->
+
+<!-- ═══════════════════════════════════════ MODALS ════════════════════════════════════════ -->
+
+<!-- Reply Modal -->
+<div class="modal-overlay" id="modal-reply" onclick="closeModal('modal-reply')">
+  <div class="modal" onclick="event.stopPropagation()">
+    <div class="modal-header">
+      <h2>💬 Enviar Resposta</h2>
+      <button class="modal-close" onclick="closeModal('modal-reply')">✕</button>
+    </div>
+    <div class="modal-body">
+      <div class="reply-type-btns">
+        <button class="reply-type-btn confirm-type active" id="rtype-confirm" onclick="setReplyType('confirm')">✅ Confirmação</button>
+        <button class="reply-type-btn nostock-type" id="rtype-nostock" onclick="setReplyType('nostock')">❌ Sem Stock</button>
+        <button class="reply-type-btn info-type" id="rtype-info" onclick="setReplyType('info')">❓ Mais Info</button>
+      </div>
+      <div class="form-group" style="margin-bottom:14px">
+        <label>Mensagem a enviar:</label>
+        <textarea id="reply-text" class="form-input" rows="5"></textarea>
+      </div>
+      <div class="form-group">
+        <label>Actualizar estado para:</label>
+        <select id="reply-status-change" class="form-input">
+          <option value="">— Não alterar —</option>
+          <option value="confirmada">🟢 Confirmada</option>
+          <option value="sem-stock">🔴 Sem Stock</option>
+          <option value="analise">🔵 Em Análise</option>
+        </select>
+      </div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn btn-ghost" onclick="closeModal('modal-reply')">Cancelar</button>
+      <button class="btn btn-primary" onclick="copyAndOpenMessenger()">📋 Copiar + Abrir Messenger</button>
+    </div>
+  </div>
+</div>
+
+<!-- Notes Modal -->
+<div class="modal-overlay" id="modal-notes" onclick="closeModal('modal-notes')">
+  <div class="modal" onclick="event.stopPropagation()">
+    <div class="modal-header">
+      <h2>📝 Notas Internas</h2>
+      <button class="modal-close" onclick="closeModal('modal-notes')">✕</button>
+    </div>
+    <div class="modal-body">
+      <input type="hidden" id="notes-order-id" />
+      <div class="form-group">
+        <label>Nota (não é enviada ao cliente):</label>
+        <textarea id="notes-text" class="form-input" rows="4" placeholder="Ex: Cliente pediu entrega urgente..."></textarea>
+      </div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn btn-ghost" onclick="closeModal('modal-notes')">Cancelar</button>
+      <button class="btn btn-primary" onclick="saveNotes()">💾 Guardar</button>
+    </div>
+  </div>
+</div>
+
+<!-- Confirm Modal -->
+<div class="modal-overlay" id="modal-confirm" onclick="closeModal('modal-confirm')">
+  <div class="modal" onclick="event.stopPropagation()" style="max-width:380px">
+    <div class="modal-header">
+      <h2 id="confirm-title">Confirmação</h2>
+      <button class="modal-close" onclick="closeModal('modal-confirm')">✕</button>
+    </div>
+    <div class="modal-body">
+      <p id="confirm-msg" style="color:var(--text-sec);font-size:14px;line-height:1.6"></p>
+    </div>
+    <div class="modal-footer">
+      <button class="btn btn-ghost" onclick="closeModal('modal-confirm')">Cancelar</button>
+      <button class="btn btn-danger" id="confirm-ok">Confirmar</button>
+    </div>
+  </div>
+</div>
+
+<!-- Edit Template Modal -->
+<div class="modal-overlay" id="modal-template" onclick="closeModal('modal-template')">
+  <div class="modal" onclick="event.stopPropagation()">
+    <div class="modal-header">
+      <h2 id="tpl-modal-title">✏️ Editar Template</h2>
+      <button class="modal-close" onclick="closeModal('modal-template')">✕</button>
+    </div>
+    <div class="modal-body">
+      <input type="hidden" id="tpl-idx" />
+      <div class="form-group" style="margin-bottom:12px">
+        <label>Nome</label>
+        <input type="text" id="tpl-name" class="form-input" />
+      </div>
+      <div class="form-group" style="margin-bottom:12px">
+        <label>Ícone</label>
+        <input type="text" id="tpl-icon" class="form-input" style="max-width:80px" />
+      </div>
+      <div class="form-group">
+        <label>Mensagem (use {nome})</label>
+        <textarea id="tpl-text" class="form-input" rows="5"></textarea>
+      </div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn btn-ghost" onclick="closeModal('modal-template')">Cancelar</button>
+      <button class="btn btn-primary" onclick="saveTemplate()">💾 Guardar</button>
+    </div>
+  </div>
+</div>
+
+<!-- Toast -->
+<div class="toast" id="toast"></div>
+
+<script src="orders.js"></script>
+</body>
+</html>
