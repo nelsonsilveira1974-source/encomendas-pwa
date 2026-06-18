@@ -741,11 +741,64 @@ function copyAndOpenMessenger() {
   copyToClipboard(text, '📋 Mensagem copiada! Cole no Messenger.');
   if (newStatus && currentReplyId) setStatus(currentReplyId, newStatus);
 
-  const o = orders.find(x => x.id === currentReplyId);
+  const o = orders.find(x => x.id === currentReplyId) || reviewQueue.find(x => x.id === currentReplyId);
   setTimeout(() => {
     window.open(o?.conversationUrl || 'https://business.facebook.com/latest/inbox/', '_blank', 'noopener');
   }, 400);
   closeModal('modal-reply');
+}
+
+async function sendDirectlyFromModal() {
+  const text = document.getElementById('reply-text').value.trim();
+  const newStatus = document.getElementById('reply-status-change').value;
+  if (!text) { showToast('⚠️ Escreva uma mensagem primeiro'); return; }
+
+  const o = orders.find(x => x.id === currentReplyId) || reviewQueue.find(x => x.id === currentReplyId);
+  if (!o) { showToast('❌ Encomenda não encontrada'); return; }
+
+  let senderId = o.senderId;
+  if (!senderId && o.conversationUrl) {
+    const parts = o.conversationUrl.split('/');
+    const lastPart = parts[parts.length - 1];
+    if (lastPart && lastPart.match(/^\d+$/)) {
+      senderId = lastPart;
+    }
+  }
+
+  if (!senderId) {
+    showToast('⚠️ Não foi possível identificar o ID do Facebook do cliente. Use a opção Copiar + Abrir.');
+    return;
+  }
+
+  if (!isServerSyncEnabled || !serverApiUrl) {
+    showToast('⚠️ Ligue a Sincronização com o Chatbot nas Configurações primeiro.');
+    return;
+  }
+
+  showToast('✈️ A enviar mensagem...');
+  try {
+    const response = await fetch(`${serverApiUrl}/api/send-message`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ senderId, text })
+    });
+
+    const data = await response.json();
+    if (!response.ok) {
+      throw new Error(data.error || 'Erro ao enviar');
+    }
+
+    showToast('✅ Mensagem enviada com sucesso para o Messenger!');
+    
+    if (newStatus && currentReplyId) {
+      setStatus(currentReplyId, newStatus);
+    }
+    
+    closeModal('modal-reply');
+  } catch (err) {
+    console.error('Erro ao enviar mensagem direta:', err);
+    showToast(`❌ Falha ao enviar: ${err.message}`);
+  }
 }
 
 function openMessengerInbox() {

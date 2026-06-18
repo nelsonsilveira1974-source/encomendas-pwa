@@ -471,9 +471,12 @@
         </select>
       </div>
     </div>
-    <div class="modal-footer">
+    <div class="modal-footer" style="display:flex; justify-content:space-between; align-items:center; width:100%; gap:8px;">
       <button class="btn btn-ghost" onclick="closeModal('modal-reply')">Cancelar</button>
-      <button class="btn btn-primary" onclick="copyAndOpenMessenger()">📋 Copiar + Abrir Messenger</button>
+      <div style="display:flex; gap:8px;">
+        <button class="btn btn-ghost" style="border-color:var(--indigo);color:var(--indigo)" onclick="copyAndOpenMessenger()">📋 Copiar + Abrir</button>
+        <button class="btn btn-primary" onclick="sendDirectlyFromModal()">✈️ Enviar Direto</button>
+      </div>
     </div>
   </div>
 </div>
