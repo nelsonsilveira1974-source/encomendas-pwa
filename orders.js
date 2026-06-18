@@ -106,7 +106,7 @@ function saveData() {
 const SECTION_META = {
   queue:    ['🗂️ Fila de Triagem', 'Encomendas por ordem de chegada', true,  true],
   history:  ['📋 Histórico',        'Encomendas processadas',          false, true],
-  review:   ['🔎 Para Rever',       'Mensagens sem palavras-chave',    false, false],
+  review:   ['🔎 Para Rever',       'Mensagens sem palavras-chave',    false, true],
   import:   ['📥 Importar',         'Adicionar encomendas manualmente', false, false],
   replies:  ['💬 Respostas',        'Templates de mensagens rápidas',  false, false],
   settings: ['⚙️ Configurações',   'Auto-sync e palavras-chave',      false, false],
@@ -231,6 +231,10 @@ function renderReview() {
 }
 
 function buildReviewCard(r) {
+  const messengerBtn = r.conversationUrl
+    ? `<a class="btn btn-ghost btn-sm" href="${esc(r.conversationUrl)}" target="_blank" rel="noopener">💬 Messenger</a>`
+    : `<button class="btn btn-ghost btn-sm" onclick="openMessengerInbox()">💬 Inbox</button>`;
+
   return `
     <div class="order-card status-analise" style="opacity:0.85">
       <div class="order-top">
@@ -243,6 +247,8 @@ function buildReviewCard(r) {
       <div class="order-msg">${esc(r.message)}</div>
       <div class="order-actions">
         <button class="btn btn-confirm btn-sm" onclick="promoteToOrder('${r.id}')">✅ É uma encomenda</button>
+        <button class="btn btn-ghost btn-sm"   onclick="openReplyModal('${r.id}')">💬 Resposta</button>
+        ${messengerBtn}
         <button class="btn btn-danger btn-sm"  onclick="dismissReview('${r.id}')">🗑️ Ignorar</button>
       </div>
     </div>
@@ -691,7 +697,14 @@ function requestNotification(count) {
 // STATUS MANAGEMENT
 // ─────────────────────────────────────────────
 function setStatus(id, status) {
-  const o = orders.find(x => x.id === id);
+  let o = orders.find(x => x.id === id);
+  if (!o) {
+    const r = reviewQueue.find(x => x.id === id);
+    if (r) {
+      reviewQueue = reviewQueue.filter(x => x.id !== id);
+      o = addOrderObj(r);
+    }
+  }
   if (!o) return;
   o.status    = status;
   o.updatedAt = new Date().toISOString();
