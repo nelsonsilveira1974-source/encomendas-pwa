@@ -1,950 +1,1214 @@
 /* =============================================
-   Facebook Comment Bot — Server
-   Express Server + Facebook Webhook Integration
+   Encomendas Messenger — App Logic v2
+   Auto-sync MacroDroid + Keyword Detection
    ============================================= */
+'use strict';
 
-require('dotenv').config();
-const express = require('express');
-const axios = require('axios');
-const fs = require('fs');
-const path = require('path');
+// ─────────────────────────────────────────────
+// STATE
+// ─────────────────────────────────────────────
+let orders        = [];
+let reviewQueue   = [];   // messages not matching keywords
+let templates     = [];
+let keywords      = [];
+let orderCounter  = 0;
+let currentSection   = 'queue';
+let currentFilter    = 'all';
+let currentReplyId   = null;
 
-const dbPath = path.join(__dirname, 'orders_db.json');
+// Auto-sync state
+let fileHandle      = null;
+let syncTimer       = null;
+let lastFileContent = '';
+let syncStats       = { total: 0, orders: 0, review: 0 };
+let isSyncing       = false;
 
-function readOrdersFromDB() {
-  try {
-    if (!fs.existsSync(dbPath)) {
-      fs.writeFileSync(dbPath, '[]');
-      return [];
-    }
-    const data = fs.readFileSync(dbPath, 'utf8');
-    return JSON.parse(data || '[]');
-  } catch (e) {
-    console.error('❌ Erro ao ler base de dados JSON:', e.message);
-    return [];
+// Chatbot Server sync state
+let serverApiUrl        = 'http://localhost:5000';
+let isServerSyncEnabled = false;
+let serverSyncTimer     = null;
+
+// ─────────────────────────────────────────────
+// STORAGE KEYS
+// ─────────────────────────────────────────────
+const K_ORDERS    = 'messenger_orders';
+const K_REVIEW    = 'messenger_review';
+const K_TEMPLATES = 'messenger_templates';
+const K_KEYWORDS  = 'messenger_keywords';
+const K_COUNTER   = 'messenger_counter';
+const K_SYNCSTATS = 'messenger_syncstats';
+const K_FNAME     = 'messenger_filename';
+const K_SERVER_URL  = 'chatbot_server_url';
+const K_SERVER_SYNC = 'chatbot_server_sync_enabled';
+
+// ─────────────────────────────────────────────
+// DEFAULT KEYWORDS (Portuguese order terms)
+// ─────────────────────────────────────────────
+const DEFAULT_KEYWORDS = [
+  'quero', 'queria', 'queria encomendar', 'encomendar', 'encomenda',
+  'comprar', 'compra', 'pedir', 'pedido', 'preciso', 'gostava',
+  'quantidade', 'unidades', 'disponível', 'stock', 'preço',
+  'quanto custa', 'tem à venda', 'posso encomendar', 'reservar'
+];
+
+// ─────────────────────────────────────────────
+// BOOT
+// ─────────────────────────────────────────────
+document.addEventListener('DOMContentLoaded', () => {
+  loadData();
+  setDefaultDateTime();
+  buildBookmarkletLink();
+  renderAll();
+  updateSyncUI();
+  initServerSync();
+  registerSW();
+});
+
+function registerSW() {
+  if ('serviceWorker' in navigator) {
+    navigator.serviceWorker.register('./sw.js').catch(() => {});
   }
 }
 
-function writeOrdersToDB(orders) {
-  try {
-    fs.writeFileSync(dbPath, JSON.stringify(orders, null, 2));
-  } catch (e) {
-    console.error('❌ Erro ao escrever na base de dados JSON:', e.message);
-  }
+// ─────────────────────────────────────────────
+// PERSISTENCE
+// ─────────────────────────────────────────────
+function loadData() {
+  try { orders      = JSON.parse(localStorage.getItem(K_ORDERS)    || '[]'); } catch { orders = []; }
+  try { reviewQueue = JSON.parse(localStorage.getItem(K_REVIEW)    || '[]'); } catch { reviewQueue = []; }
+  try { templates   = JSON.parse(localStorage.getItem(K_TEMPLATES) || 'null') || defaultTemplates(); } catch { templates = defaultTemplates(); }
+  try { keywords    = JSON.parse(localStorage.getItem(K_KEYWORDS)  || 'null') || [...DEFAULT_KEYWORDS]; } catch { keywords = [...DEFAULT_KEYWORDS]; }
+  try { syncStats   = JSON.parse(localStorage.getItem(K_SYNCSTATS) || '{}');  } catch { syncStats = {}; }
+  try { orderCounter = parseInt(localStorage.getItem(K_COUNTER) || '0', 10); } catch { orderCounter = 0; }
+
+  serverApiUrl = localStorage.getItem(K_SERVER_URL) || 'http://localhost:5000';
+  isServerSyncEnabled = localStorage.getItem(K_SERVER_SYNC) === 'true';
+
+  // Back-fill sequence numbers
+  orders.forEach(o => { if (!o.seq) { orderCounter++; o.seq = orderCounter; } });
+  saveData();
 }
 
-async function saveOrderToDB(newOrder) {
-  try {
-    const orders = readOrdersFromDB();
-    orders.push(newOrder);
-    writeOrdersToDB(orders);
-    console.log(`✅ [DB] Encomenda de ${newOrder.name} guardada em orders_db.json!`);
-  } catch (e) {
-    console.error('❌ Erro ao guardar encomenda na base de dados:', e.message);
-  }
+function saveData() {
+  localStorage.setItem(K_ORDERS,    JSON.stringify(orders));
+  localStorage.setItem(K_REVIEW,    JSON.stringify(reviewQueue));
+  localStorage.setItem(K_TEMPLATES, JSON.stringify(templates));
+  localStorage.setItem(K_KEYWORDS,  JSON.stringify(keywords));
+  localStorage.setItem(K_COUNTER,   String(orderCounter));
+  localStorage.setItem(K_SYNCSTATS, JSON.stringify(syncStats));
+  localStorage.setItem(K_SERVER_URL,  serverApiUrl);
+  localStorage.setItem(K_SERVER_SYNC, String(isServerSyncEnabled));
 }
 
-// Buffer de Logs em memória para monitorização fácil via browser
-const logs = [];
-const originalConsole = {
-  log: console.log,
-  warn: console.warn,
-  error: console.error
+// ─────────────────────────────────────────────
+// NAVIGATION
+// ─────────────────────────────────────────────
+const SECTION_META = {
+  queue:    ['🗂️ Fila de Triagem', 'Encomendas por ordem de chegada', true,  true],
+  history:  ['📋 Histórico',        'Encomendas processadas',          false, true],
+  review:   ['🔎 Para Rever',       'Mensagens sem palavras-chave',    false, false],
+  import:   ['📥 Importar',         'Adicionar encomendas manualmente', false, false],
+  replies:  ['💬 Respostas',        'Templates de mensagens rápidas',  false, false],
+  settings: ['⚙️ Configurações',   'Auto-sync e palavras-chave',      false, false],
 };
 
-function addLog(type, ...args) {
-  const msg = args.map(arg => typeof arg === 'object' ? JSON.stringify(arg, null, 2) : arg).join(' ');
-  const time = new Date().toISOString();
-  logs.push(`[${time}] [${type}] ${msg}`);
-  if (logs.length > 200) logs.shift();
-  originalConsole[type.toLowerCase() === 'log' ? 'log' : type.toLowerCase() === 'warn' ? 'warn' : 'error'](...args);
+function showSection(name) {
+  currentSection = name;
+  document.querySelectorAll('.section').forEach(s => s.classList.remove('active'));
+  document.querySelectorAll('.nav-btn').forEach(b => b.classList.remove('active'));
+
+  const sec = document.getElementById('section-' + name);
+  if (sec) sec.classList.add('active');
+  ['nav-', 'mnav-'].forEach(p => {
+    const b = document.getElementById(p + name);
+    if (b) b.classList.add('active');
+  });
+
+  const meta = SECTION_META[name] || [name, '', false, false];
+  document.getElementById('topbar-title').textContent = meta[0];
+  document.getElementById('topbar-sub').textContent   = meta[1];
+  document.getElementById('filter-bar').style.display  = meta[2] ? 'flex' : 'none';
+  document.getElementById('stats-bar').style.display   = meta[3] ? 'flex' : 'none';
+
+  if (name === 'queue')    renderQueue();
+  if (name === 'history')  renderHistory();
+  if (name === 'review')   renderReview();
+  if (name === 'replies')  renderTemplates();
+  if (name === 'settings') { renderKeywords(); renderSyncConnectedUI(); }
 }
 
-console.log = (...args) => addLog('LOG', ...args);
-console.warn = (...args) => addLog('WARN', ...args);
-console.error = (...args) => addLog('ERROR', ...args);
-
-const app = express();
-app.use(express.json());
-
-// CORS Middleware personalizado
-app.use((req, res, next) => {
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
-  if (req.method === 'OPTIONS') {
-    return res.sendStatus(200);
-  }
-  next();
-});
-
-const PORT = process.env.PORT || 5000;
-const PAGE_ACCESS_TOKEN = process.env.PAGE_ACCESS_TOKEN;
-const VERIFY_TOKEN = process.env.VERIFY_TOKEN;
-const REPLY_TEMPLATE = process.env.REPLY_TEMPLATE || 'Olá {nome}! Completa a tua encomenda aqui... :) {link}';
-const MESSENGER_CHATBOT_ACTIVE = process.env.MESSENGER_CHATBOT_ACTIVE === 'true';
-
-// Test Page Access Token on boot (optional warning)
-if (!PAGE_ACCESS_TOKEN || PAGE_ACCESS_TOKEN === 'O_TEU_PAGE_ACCESS_TOKEN_AQUI') {
-  console.warn('⚠️ AVISO: PAGE_ACCESS_TOKEN não está configurado corretamente no ficheiro .env');
-}
-if (!VERIFY_TOKEN || VERIFY_TOKEN === 'o_teu_token_de_verificacao_secreto') {
-  console.warn('⚠️ AVISO: VERIFY_TOKEN está a usar o valor padrão no ficheiro .env');
+// ─────────────────────────────────────────────
+// FILTER
+// ─────────────────────────────────────────────
+function setFilter(f) {
+  currentFilter = f;
+  document.querySelectorAll('.filter-tab').forEach(t => t.classList.remove('active'));
+  const tab = document.getElementById('ftab-' + f);
+  if (tab) tab.classList.add('active');
+  renderQueue();
 }
 
-// Rota de visualização de logs em tempo real
-app.get('/logs', (req, res) => {
-  res.setHeader('Content-Type', 'text/plain; charset=utf-8');
-  res.send(logs.join('\n'));
-});
-
-/* ─────────────────────────────────────────────
-   FUNÇÃO AUXILIAR: Verificar se é Direto Ativo (LIVE)
-   ───────────────────────────────────────────── */
-async function isPostCurrentlyLive(postId, accessToken) {
-  try {
-    console.log(`[LIVE CHECK] A verificar ID do post: ${postId}`);
-    
-    // ESTRATÉGIA A: Tentar obter o object_id do post (caso seja um Post normal associado a um vídeo)
-    let objectId = null;
-    try {
-      const postResponse = await axios.get(
-        `https://graph.facebook.com/v19.0/${postId}`,
-        {
-          params: {
-            fields: 'object_id,status_type',
-            access_token: accessToken
-          }
-        }
-      );
-      const postData = postResponse.data;
-      console.log(`[LIVE CHECK] Dados do post (Estrutura A):`, JSON.stringify(postData));
-      objectId = postData.object_id;
-    } catch (e) {
-      console.log(`[LIVE CHECK] Falha ao ler post (Estrutura A - pode ser ID de vídeo direto): ${e.message}`);
-    }
-
-    // ESTRATÉGIA B: Consultar o estado do vídeo (usando objectId se disponível, senão o próprio postId)
-    const targetId = objectId || postId;
-    console.log(`[LIVE CHECK] A verificar estado da transmissão no ID do objeto: ${targetId}`);
-    
-    try {
-      const videoResponse = await axios.get(
-        `https://graph.facebook.com/v19.0/${targetId}`,
-        {
-          params: {
-            fields: 'live_status,broadcast_status,status',
-            access_token: accessToken
-          }
-        }
-      );
-      const videoData = videoResponse.data;
-      console.log(`[LIVE CHECK] Dados do vídeo (Estrutura B):`, JSON.stringify(videoData));
-
-      const liveStatus = (videoData.live_status || '').toUpperCase();
-      const broadcastStatus = (videoData.broadcast_status || '').toUpperCase();
-      const status = (videoData.status || '').toUpperCase();
-
-      const isLive = liveStatus === 'LIVE' || broadcastStatus === 'LIVE' || status === 'LIVE';
-      console.log(`[LIVE CHECK] Resultado (Estrutura B): live_status=${liveStatus}, broadcast_status=${broadcastStatus}, status=${status} -> isLive=${isLive}`);
-      if (isLive) return true;
-    } catch (e) {
-      console.log(`[LIVE CHECK] Falha ao ler vídeo (Estrutura B): ${e.message}`);
-    }
-
-    // ESTRATÉGIA C: Listar diretos ativos da página (/live_videos?broadcast_status=LIVE)
-    try {
-      const pageId = postId.split('_')[0];
-      if (pageId && pageId.match(/^\d+$/)) {
-        console.log(`[LIVE CHECK] A listar diretos ativos da página ${pageId} (Estrutura C)...`);
-        const liveVideosResponse = await axios.get(
-          `https://graph.facebook.com/v19.0/${pageId}/live_videos`,
-          {
-            params: {
-              broadcast_status: 'LIVE',
-              fields: 'id,video',
-              access_token: accessToken
-            }
-          }
-        );
-        const liveVideos = liveVideosResponse.data.data || [];
-        console.log(`[LIVE CHECK] Diretos ativos encontrados na página:`, JSON.stringify(liveVideos));
-        
-        for (const liveVideo of liveVideos) {
-          const liveVideoId = liveVideo.id;
-          const videoId = liveVideo.video ? liveVideo.video.id : null;
-          
-          if (postId.includes(liveVideoId) || (videoId && postId.includes(videoId)) || (objectId && (objectId === liveVideoId || objectId === videoId))) {
-            console.log(`[LIVE CHECK] Match encontrado com o direto ativo ${liveVideoId}!`);
-            return true;
-          }
-        }
-      }
-    } catch (e) {
-    }
-
-    console.log(`[LIVE CHECK] Conclusão: O post ${postId} NÃO está em direto ativo.`);
-    return false;
-  } catch (error) {
-    console.error('[LIVE CHECK] Erro crítico no filtro de diretos:', error.message);
-    return false;
-  }
+// ─────────────────────────────────────────────
+// RENDER ALL
+// ─────────────────────────────────────────────
+function renderAll() {
+  updateStats();
+  if (currentSection === 'queue')   renderQueue();
+  if (currentSection === 'history') renderHistory();
+  if (currentSection === 'review')  renderReview();
+  if (currentSection === 'replies') renderTemplates();
 }
 
-/* ─────────────────────────────────────────────
-   FUNÇÕES AUXILIARES: Obtenção de Texto e Filtro de Exclusão
-   ───────────────────────────────────────────── */
-async function getPostMessage(postId, accessToken) {
-  try {
-    const response = await axios.get(
-      `https://graph.facebook.com/v19.0/${postId}`,
-      {
-        params: {
-          fields: 'message',
-          access_token: accessToken
-        }
-      }
-    );
-    return response.data.message || '';
-  } catch (error) {
-    console.log(`⚠️ [FILTER] Não foi possível obter o texto do post ${postId}: ${error.message}`);
-    return '';
-  }
+// ─────────────────────────────────────────────
+// STATS
+// ─────────────────────────────────────────────
+function updateStats() {
+  const pending   = orders.filter(o => o.status === 'pendente').length;
+  const analysis  = orders.filter(o => o.status === 'analise').length;
+  const confirmed = orders.filter(o => o.status === 'confirmada').length;
+  const noStock   = orders.filter(o => o.status === 'sem-stock').length;
+  const review    = reviewQueue.length;
+
+  setText('stat-pending',   pending);
+  setText('stat-review',    review);
+  setText('stat-confirmed', confirmed);
+  setText('stat-nostock',   noStock);
+
+  // Pending badge (queue nav)
+  const pBadge = pending + analysis;
+  updateBadge('badge-pending',  'mbadge-pending', pBadge);
+  updateBadge('badge-review',   'mbadge-review',  review, true);
 }
 
-function hasExclusionWord(text) {
-  if (!text) return false;
-  const exclusionWords = [
-    'direto', 'diretos',
-    'aviso', 'avisos',
-    'comunicado', 'comunicados',
-    'live', 'lives',
-    'esclarecimento', 'esclarecimentos',
-    'informação', 'informações',
-    'comunicação', 'comunicações'
-  ];
-  
-  // Normalizar: passar para minúsculas, remover acentos e pontuação
-  const cleanText = text.toLowerCase()
-    .normalize("NFD")
-    .replace(/[\u0300-\u036f]/g, "") // Remove acentos
-    .replace(/[.,\/#!$%\^&\*;:{}=\-_`~()?]/g, " "); // Substitui pontuação por espaço
-  
-  // Lista limpa de palavras de exclusão (sem acentos)
-  const cleanExclusionWords = exclusionWords.map(w => 
-    w.normalize("NFD").replace(/[\u0300-\u036f]/g, "")
+function updateBadge(id, mid, count, amber) {
+  [id, mid].forEach(bid => {
+    const el = document.getElementById(bid);
+    if (!el) return;
+    el.textContent    = count;
+    el.style.display  = count > 0 ? 'flex' : 'none';
+  });
+}
+
+// ─────────────────────────────────────────────
+// QUEUE RENDER
+// ─────────────────────────────────────────────
+function renderQueue() {
+  const search = (document.getElementById('queue-search')?.value || '').toLowerCase().trim();
+  const list   = document.getElementById('orders-list');
+  const empty  = document.getElementById('empty-queue');
+
+  let filtered = [...orders].sort((a, b) =>
+    new Date(a.receivedAt) - new Date(b.receivedAt) || a.seq - b.seq
   );
-  
-  const words = cleanText.split(/\s+/);
-  return words.some(word => cleanExclusionWords.includes(word));
+
+  if (currentFilter !== 'all') filtered = filtered.filter(o => o.status === currentFilter);
+  if (search) filtered = filtered.filter(o =>
+    o.name.toLowerCase().includes(search) ||
+    o.message.toLowerCase().includes(search) ||
+    (o.product || '').toLowerCase().includes(search)
+  );
+
+  updateStats();
+  list.innerHTML  = filtered.length ? filtered.map(buildOrderCard).join('') : '';
+  empty.style.display = filtered.length ? 'none' : 'block';
 }
 
-async function likeComment(commentId, accessToken) {
-  try {
-    console.log(`👍 A colocar Like no comentário ${commentId}...`);
-    const response = await axios.post(
-      `https://graph.facebook.com/v19.0/${commentId}/likes`,
-      null,
-      { params: { access_token: accessToken } }
-    );
-    if (response.data && response.data.success) {
-      console.log(`✅ Like colocado com sucesso no comentário ${commentId}!`);
-    }
-  } catch (error) {
-    console.error(`❌ Erro ao colocar Like no comentário ${commentId}:`);
-    if (error.response && error.response.data) {
-      console.error(JSON.stringify(error.response.data, null, 2));
-    } else {
-      console.error(error.message);
-    }
+// ─────────────────────────────────────────────
+// REVIEW RENDER (non-keyword messages)
+// ─────────────────────────────────────────────
+function renderReview() {
+  const list  = document.getElementById('review-list');
+  const empty = document.getElementById('empty-review');
+
+  if (!reviewQueue.length) {
+    list.innerHTML = '';
+    empty.style.display = 'block';
+    return;
   }
+  empty.style.display = 'none';
+  list.innerHTML = reviewQueue.map(r => buildReviewCard(r)).join('');
 }
 
-function classifyCommentAndGetReply(commentText, senderName) {
-  const firstName = senderName.split(' ')[0];
-  if (!commentText) {
-    return {
-      text: REPLY_TEMPLATE.replace('{nome}', firstName),
-      isSales: true,
-      type: 'sales'
-    };
-  }
+function buildReviewCard(r) {
+  return `
+    <div class="order-card status-analise" style="opacity:0.85">
+      <div class="order-top">
+        <div class="order-meta">
+          <div class="order-name">${esc(r.name)}</div>
+          <div class="order-time">⏱ ${formatTime(r.receivedAt)}</div>
+        </div>
+        <span class="order-status" style="background:rgba(139,92,246,0.15);color:#8b5cf6">🔎 A Rever</span>
+      </div>
+      <div class="order-msg">${esc(r.message)}</div>
+      <div class="order-actions">
+        <button class="btn btn-confirm btn-sm" onclick="promoteToOrder('${r.id}')">✅ É uma encomenda</button>
+        <button class="btn btn-danger btn-sm"  onclick="dismissReview('${r.id}')">🗑️ Ignorar</button>
+      </div>
+    </div>
+  `;
+}
 
-  // Normalizar texto para análise (minúsculas, sem acentos e pontuação)
-  const normalized = commentText.toLowerCase()
-    .normalize("NFD")
-    .replace(/[\u0300-\u036f]/g, "") // Remove acentos
-    .replace(/[.,\/#!$%\^&\*;:{}=\-_`~()?]/g, " "); // Substitui pontuação por espaço
+function promoteToOrder(id) {
+  const r = reviewQueue.find(x => x.id === id);
+  if (!r) return;
+  reviewQueue = reviewQueue.filter(x => x.id !== id);
+  addOrderObj(r);
+  saveData();
+  renderAll();
+  renderReview();
+  showToast('✅ Movido para a fila de encomendas');
+}
 
-  const words = normalized.split(/\s+/);
+function dismissReview(id) {
+  reviewQueue = reviewQueue.filter(x => x.id !== id);
+  saveData();
+  renderReview();
+  updateStats();
+  showToast('🗑️ Mensagem ignorada');
+}
 
-  // 1. Envio à Cobrança (prioridade)
-  const cobrancaKeywords = ['cobranca', 'cobrar', 'reembolso', 'contrarreembolso'];
-  const isCobranca = words.some(word => cobrancaKeywords.some(kw => word.startsWith(kw)));
-  if (isCobranca) {
-    return {
-      text: `Olá ${firstName}! Não fazemos envios à cobrança. Se tiveres outra dúvida, fala connosco no Messenger: {link}`,
-      isSales: false,
-      type: 'cobranca'
-    };
-  }
-
-  // 2. Entregas / Envios / Portes
-  const entregaKeywords = ['entrega', 'entregas', 'entregam', 'envia', 'enviam', 'envio', 'envios', 'portes', 'enviar', 'entregar'];
-  const isEntrega = words.some(word => entregaKeywords.includes(word));
-  if (isEntrega) {
-    return {
-      text: `Olá ${firstName}! Sim, fazemos entregas via CTT ou via transportadora, e os portes são calculados conforme o peso. Fala connosco no Messenger: {link}`,
-      isSales: false,
-      type: 'entrega'
-    };
-  }
-
-  // 3. Intenção de compra, reserva ou encomenda ("parecem encomendas")
-  const salesKeywords = [
-    'comprar', 'compra', 'compro', 'compras',
-    'reservar', 'reserva', 'reservo', 'reservas',
-    'encomendar', 'encomenda', 'encomendo', 'encomendas',
-    'quero', 'queria', 'gostava', 'gostaria',
-    'preco', 'valor', 'quanto', 'custo', 'custa',
-    'tamanho', 'tamanhos', 'cor', 'cores', 'disponivel', 'medidas'
-  ];
-  const isSalesIntent = words.some(word => salesKeywords.some(kw => word.startsWith(kw)));
-  if (isSalesIntent) {
-    return {
-      text: REPLY_TEMPLATE.replace('{nome}', firstName),
-      isSales: true,
-      type: 'sales'
-    };
-  }
-
-  // 4. Mensagem simpática genérica para outros comentários
-  return {
-    text: `Olá ${firstName}! Muito obrigado pelo teu comentário e carinho! 🌸 Se precisares de alguma coisa, fala connosco diretamente no Messenger: {link}`,
-    isSales: false,
-    type: 'generic'
+// ─────────────────────────────────────────────
+// ORDER CARD
+// ─────────────────────────────────────────────
+function buildOrderCard(o) {
+  const STATUS = {
+    pendente:   '🟡 Pendente',
+    analise:    '🔵 Em Análise',
+    confirmada: '🟢 Confirmada',
+    'sem-stock':'🔴 Sem Stock'
   };
+  const seq     = String(o.seq).padStart(3, '0');
+  const isActive = o.status === 'pendente' || o.status === 'analise';
+
+  // Highlight matched keywords in message
+  const msgHighlighted = highlightKeywords(esc(o.message));
+
+  const messengerBtn = o.conversationUrl
+    ? `<a class="btn btn-ghost btn-sm" href="${esc(o.conversationUrl)}" target="_blank" rel="noopener">💬 Messenger</a>`
+    : `<button class="btn btn-ghost btn-sm" onclick="openMessengerInbox()">💬 Inbox</button>`;
+
+  const actionBtns = isActive ? `
+    <button class="btn btn-review btn-sm"  onclick="setStatus('${o.id}','analise')">🔵 Analisar</button>
+    <button class="btn btn-confirm btn-sm" onclick="quickConfirm('${o.id}')">✅ Confirmar</button>
+    <button class="btn btn-nostock btn-sm" onclick="quickNoStock('${o.id}')">❌ Sem Stock</button>
+    <button class="btn btn-ghost btn-sm"   onclick="openReplyModal('${o.id}')">💬 Resposta</button>
+  ` : `
+    <button class="btn btn-ghost btn-sm" onclick="setStatus('${o.id}','pendente')">↩️ Reabrir</button>
+    <button class="btn btn-ghost btn-sm" onclick="openReplyModal('${o.id}')">💬 Resposta</button>
+  `;
+
+  const notesHtml = o.notes
+    ? `<div class="order-notes-display has-notes">📝 ${esc(o.notes)}</div>`
+    : `<div class="order-notes-display"></div>`;
+
+  // Keyword match chips
+  const matched = keywords.filter(kw => o.message.toLowerCase().includes(kw.toLowerCase()));
+  const kw_chips = matched.length
+    ? `<div class="kw-chips">${matched.slice(0,4).map(kw => `<span class="kw-chip">${esc(kw)}</span>`).join('')}</div>`
+    : '';
+
+  return `
+    <div class="order-card status-${o.status}" id="card-${o.id}">
+      <div class="order-top">
+        <span class="order-num">#${seq}</span>
+        <div class="order-meta">
+          <div class="order-name">${esc(o.name)}</div>
+          <div class="order-time">⏱ ${formatTime(o.receivedAt)}</div>
+        </div>
+        <span class="order-status">${STATUS[o.status] || o.status}</span>
+      </div>
+      <div class="order-msg" id="msg-${o.id}">${msgHighlighted}</div>
+      ${kw_chips}
+      ${notesHtml}
+      <div class="order-actions">
+        ${actionBtns}
+        <button class="btn btn-icon btn-sm" onclick="openNotesModal('${o.id}')" title="Notas">📝</button>
+        <button class="btn btn-icon btn-sm" onclick="toggleExpand('${o.id}')" title="Detalhes">🔍</button>
+        ${messengerBtn}
+        <button class="btn btn-icon btn-sm" style="color:var(--rose)" onclick="deleteOrder('${o.id}')" title="Eliminar">🗑️</button>
+      </div>
+      <div class="order-expanded" id="exp-${o.id}">
+        ${o.product ? `<div class="order-detail-label">Produto</div><div class="order-detail-text">${esc(o.product)}</div>` : ''}
+        <div class="order-detail-label">Mensagem completa</div>
+        <div class="order-detail-text">${esc(o.message)}</div>
+      </div>
+    </div>
+  `;
 }
 
-/* ─────────────────────────────────────────────
-   FUNÇÃO AUXILIAR: Responder ao Cliente no Messenger (Chatbot)
-   ───────────────────────────────────────────── */
-// Cache temporário em memória para evitar duplicações de respostas (standalone referral + message referral)
-const recentReferrals = new Map();
+function toggleExpand(id) {
+  document.getElementById('exp-' + id)?.classList.toggle('open');
+  document.getElementById('msg-' + id)?.classList.toggle('expanded');
+}
 
-async function handleMessengerReferral(senderId, postId, accessToken) {
-  try {
-    const cacheKey = `${senderId}_${postId}`;
-    const now = Date.now();
-    if (recentReferrals.has(cacheKey) && (now - recentReferrals.get(cacheKey) < 10000)) {
-      console.log(`ℹ️ [CHATBOT] Referência recente para o post ${postId} já processada nos últimos 10 segundos para o utilizador ${senderId}. A ignorar duplicado.`);
-      return;
-    }
-    recentReferrals.set(cacheKey, now);
+// Highlight keywords in message text
+function highlightKeywords(html) {
+  let result = html;
+  keywords.forEach(kw => {
+    const re = new RegExp('(' + escRegex(kw) + ')', 'gi');
+    result = result.replace(re, '<mark class="kw-mark">$1</mark>');
+  });
+  return result;
+}
 
-    // Limpeza rápida do cache
-    if (recentReferrals.size > 500) {
-      for (const [key, time] of recentReferrals.entries()) {
-        if (now - time > 60000) recentReferrals.delete(key);
-      }
-    }
+// ─────────────────────────────────────────────
+// HISTORY
+// ─────────────────────────────────────────────
+function renderHistory() {
+  const search  = (document.getElementById('history-search')?.value || '').toLowerCase().trim();
+  const tbody   = document.getElementById('history-tbody');
+  const empty   = document.getElementById('empty-history');
+  const STATUS  = { pendente:'🟡 Pendente', analise:'🔵 Em Análise', confirmada:'🟢 Confirmada', 'sem-stock':'🔴 Sem Stock' };
 
-    console.log(`\n🤖 [CHATBOT] A iniciar atendimento automático para PSID: ${senderId}`);
-    
-    if (!MESSENGER_CHATBOT_ACTIVE) {
-      console.log(`ℹ️ [SILENT MODE] Chatbot desativado. Prompt de referral NÃO enviado para o cliente ${senderId}.`);
-      return;
-    }
-    
-    // 1. Construir o link do post no Facebook
-    const parts = postId.split('_');
-    const pageIdVal = parts[0];
-    const storyFbid = parts[1] || parts[0];
-    const postUrl = `https://www.facebook.com/permalink.php?story_fbid=${storyFbid}&id=${pageIdVal}`;
+  let all = [...orders].sort((a, b) => new Date(b.receivedAt) - new Date(a.receivedAt));
+  if (search) all = all.filter(o =>
+    o.name.toLowerCase().includes(search) || o.message.toLowerCase().includes(search)
+  );
 
-    // 2. Tentar obter a imagem de capa do post (full_picture)
-    let pictureUrl = '';
-    try {
-      console.log(`🔍 [CHATBOT] A obter imagem do post ${postId}...`);
-      const postDetails = await axios.get(
-        `https://graph.facebook.com/v19.0/${postId}`,
-        {
-          params: {
-            fields: 'full_picture',
-            access_token: accessToken
-          }
-        }
-      );
-      pictureUrl = postDetails.data.full_picture || '';
-      console.log(`📸 [CHATBOT] Imagem encontrada: ${pictureUrl}`);
-    } catch (picError) {
-      console.log(`⚠️ [CHATBOT] Não foi possível obter a imagem do post: ${picError.message}`);
-    }
+  if (!all.length) { tbody.innerHTML = ''; empty.style.display = 'block'; return; }
+  empty.style.display = 'none';
 
-    // 3. Enviar mensagem estruturada (Generic Template) ou apenas texto se não houver imagem
-    if (pictureUrl) {
-      console.log(`✈️ [CHATBOT] A enviar template genérico com imagem e texto...`);
-      await axios.post(
-        `https://graph.facebook.com/v19.0/me/messages`,
-        {
-          recipient: { id: senderId },
-          message: {
-            attachment: {
-              type: 'template',
-              payload: {
-                template_type: 'generic',
-                elements: [
-                  {
-                    title: 'Completar Encomenda',
-                    image_url: pictureUrl,
-                    subtitle: 'Por favor, indica-nos o tamanho e a cor que pretendes para este artigo.',
-                    buttons: [
-                      {
-                        type: 'web_url',
-                        url: postUrl,
-                        title: 'Ver Artigo Original'
-                      }
-                    ]
-                  }
-                ]
-              }
-            }
-          }
-        },
-        { params: { access_token: accessToken } }
-      );
-    } else {
-      console.log(`✈️ [CHATBOT] Sem imagem. A enviar apenas mensagem de texto...`);
-      const chatMessage = `Olá! Viemos ajudar a completar a tua encomenda deste artigo: ${postUrl}\n\nPor favor, indica-nos:\n👉 O tamanho que desejas\n👉 A cor que preferes`;
-      
-      await axios.post(
-        `https://graph.facebook.com/v19.0/me/messages`,
-        {
-          recipient: { id: senderId },
-          message: { text: chatMessage }
-        },
-        { params: { access_token: accessToken } }
-      );
-    }
-    
-    console.log(`✅ [CHATBOT] Atendimento concluído com sucesso para o cliente ${senderId}!`);
-  } catch (error) {
-    console.error('❌ [CHATBOT] Erro ao responder no Messenger:', error.message);
-    if (error.response && error.response.data) {
-      console.error(JSON.stringify(error.response.data, null, 2));
-    }
+  tbody.innerHTML = all.map(o => `
+    <tr>
+      <td style="color:var(--indigo);font-weight:700">#${String(o.seq).padStart(3,'0')}</td>
+      <td class="name-cell">${esc(o.name)}</td>
+      <td style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"
+          title="${esc(o.message)}">${esc(o.message.substring(0,80))}${o.message.length > 80 ? '…' : ''}</td>
+      <td>${STATUS[o.status] || o.status}</td>
+      <td>${formatTime(o.receivedAt)}</td>
+      <td>
+        <div style="display:flex;gap:6px">
+          <button class="btn btn-ghost btn-sm" onclick="openReplyModal('${o.id}')">💬</button>
+          <button class="btn btn-ghost btn-sm" onclick="setStatus('${o.id}','pendente')">↩️</button>
+          <button class="btn btn-icon btn-sm" style="color:var(--rose)" onclick="deleteOrder('${o.id}')">🗑️</button>
+        </div>
+      </td>
+    </tr>
+  `).join('');
+}
+
+// ─────────────────────────────────────────────
+// AUTO-SYNC: FILE SYSTEM ACCESS API
+// ─────────────────────────────────────────────
+async function connectMacroDroid() {
+  if (!window.showOpenFilePicker) {
+    showToast('⚠️ Browser não suporta leitura de ficheiros automática. Use o Kiwi Browser.');
+    return;
   }
-}
-
-/* ─────────────────────────────────────────────
-   CHATBOT MESSENGER: Gestão de Sessões e Fluxo de Mensagens
-   ───────────────────────────────────────────── */
-
-// Gestão de sessões conversacionais para o Chatbot
-const sessions = new Map();
-
-// Função para limpar sessões inativas (expira após 2 horas)
-function cleanupSessions() {
-  const now = Date.now();
-  const timeout = 2 * 60 * 60 * 1000; // 2 horas
-  for (const [senderId, session] of sessions.entries()) {
-    if (now - session.lastActive > timeout) {
-      console.log(`ℹ️ [SESSÃO] Sessão de ${senderId} expirada por inatividade.`);
-      sessions.delete(senderId);
-    }
-  }
-}
-
-// Obter nome de perfil do utilizador via API Graph do Facebook
-async function getUserProfile(senderId, accessToken) {
   try {
-    const response = await axios.get(`https://graph.facebook.com/v19.0/${senderId}`, {
-      params: {
-        fields: 'first_name,last_name',
-        access_token: accessToken
-      }
+    [fileHandle] = await window.showOpenFilePicker({
+      types: [{ description: 'JSON / Text', accept: { 'application/json': ['.json'], 'text/plain': ['.txt', '.json'] } }],
+      multiple: false
     });
-    return response.data;
+
+    localStorage.setItem(K_FNAME, fileHandle.name);
+    syncStats = { total: 0, orders: 0, review: 0 };
+    lastFileContent = '';
+
+    startAutoSync();
+    await syncNow(true); // First sync
+    renderSyncConnectedUI();
+    updateSyncUI();
+    showToast('🟢 Ficheiro ligado! A sincronizar a cada 30 segundos.');
   } catch (e) {
-    console.log(`⚠️ Erro ao obter perfil do utilizador ${senderId}: ${e.message}`);
-    return { first_name: 'Cliente', last_name: 'Messenger' };
+    if (e.name !== 'AbortError') showToast('❌ Erro ao seleccionar ficheiro: ' + e.message);
   }
 }
 
-// Enviar mensagem de text simples pelo Messenger
-async function sendTextMessage(recipientId, text, accessToken) {
-  if (!MESSENGER_CHATBOT_ACTIVE) {
-    console.log(`ℹ️ [SILENT MODE] Chatbot desativado. Resposta NÃO enviada para ${recipientId}: "${text}"`);
-    return;
+function disconnectFile() {
+  fileHandle = null;
+  lastFileContent = '';
+  if (syncTimer) { clearInterval(syncTimer); syncTimer = null; }
+  localStorage.removeItem(K_FNAME);
+  renderSyncConnectedUI();
+  updateSyncUI();
+  showToast('🔌 Ficheiro desligado');
+}
+
+function startAutoSync() {
+  if (syncTimer) clearInterval(syncTimer);
+  syncTimer = setInterval(() => syncNow(false), 30000); // every 30 seconds
+}
+
+async function manualSync() {
+  let hasSync = false;
+  if (fileHandle) {
+    await syncNow(true);
+    hasSync = true;
   }
+  if (isServerSyncEnabled) {
+    await syncWithServer();
+    hasSync = true;
+  }
+  if (!hasSync) {
+    showToast('⚠️ Configure a ligação ao MacroDroid ou ao Chatbot primeiro.');
+    showSection('settings');
+  }
+}
+
+async function syncNow(notify = false) {
+  if (!fileHandle || isSyncing) return;
+  isSyncing = true;
+  setSyncBarText('🔄 A sincronizar...');
+
   try {
-    await axios.post(
-      `https://graph.facebook.com/v19.0/me/messages`,
-      {
-        recipient: { id: recipientId },
-        message: { text: text }
-      },
-      { params: { access_token: accessToken } }
-    );
-  } catch (error) {
-    console.error(`❌ Erro ao enviar mensagem para ${recipientId}:`, error.message);
-    if (error.response && error.response.data) {
-      console.error(JSON.stringify(error.response.data, null, 2));
-    }
-  }
-}
+    const file = await fileHandle.getFile();
+    const text = await file.text();
 
-// Classificar mensagens normais do cliente baseadas em intenções/palavras-chave
-function classifyMessengerMessage(text) {
-  if (!text) return 'default';
-
-  // Normalizar texto para análise (minúsculas, sem acentos e pontuação)
-  const normalized = text.toLowerCase()
-    .normalize("NFD")
-    .replace(/[\u0300-\u036f]/g, "")
-    .replace(/[.,\/#!$%\^&\*;:{}=\-_`~()?]/g, " ");
-
-  const words = normalized.split(/\s+/);
-
-  // 1. Envio à cobrança
-  const cobrancaKeywords = ['cobranca', 'cobrar', 'reembolso', 'contrarreembolso'];
-  if (words.some(word => cobrancaKeywords.some(kw => word.startsWith(kw)))) {
-    return 'cobranca';
-  }
-
-  // 2. Entregas / Envios / Portes
-  const entregaKeywords = ['entrega', 'entregas', 'entregam', 'envia', 'enviam', 'envio', 'envios', 'portes', 'enviar', 'entregar', 'ctt', 'transportadora'];
-  if (words.some(word => entregaKeywords.includes(word))) {
-    return 'entrega';
-  }
-
-  // 3. Saudações
-  const saudacaoKeywords = ['ola', 'oi', 'bom dia', 'boa tarde', 'boa noite', 'alo', 'tarde', 'noite'];
-  if (words.some(word => saudacaoKeywords.includes(word))) {
-    return 'saudacao';
-  }
-
-  // 4. Intenção de compra / Preço
-  const salesKeywords = [
-    'comprar', 'compra', 'compro', 'compras',
-    'reservar', 'reserva', 'reservo', 'reservas',
-    'encomendar', 'encomenda', 'encomendo', 'encomendas',
-    'quero', 'queria', 'gostava', 'gostaria',
-    'preco', 'valor', 'quanto', 'custo', 'custa',
-    'tamanho', 'tamanhos', 'cor', 'cores', 'disponivel', 'medidas'
-  ];
-  if (words.some(word => salesKeywords.some(kw => word.startsWith(kw)))) {
-    return 'sales';
-  }
-
-  return 'default';
-}
-
-// Processar fluxo principal de mensagens diretas
-async function handleDirectMessage(senderId, messageText, accessToken) {
-  cleanupSessions();
-  let session = sessions.get(senderId);
-
-  // Se o chatbot está desativado no Messenger, apenas guardamos as mensagens no DB para triagem manual na PWA
-  if (!MESSENGER_CHATBOT_ACTIVE) {
-    console.log(`ℹ️ [SILENT MODE] A processar mensagem recebida em modo silencioso: "${messageText}"`);
-    try {
-      const profile = await getUserProfile(senderId, accessToken);
-      const fullName = `${profile.first_name || 'Cliente'} ${profile.last_name || 'Messenger'}`.trim();
-      
-      const newMsgOrder = {
-        id: 'o_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8),
-        name: fullName,
-        message: messageText,
-        receivedAt: new Date().toISOString(),
-        conversationUrl: `https://business.facebook.com/latest/inbox/${senderId}`,
-        product: '',
-        status: 'pendente',
-        notes: session ? `Referência do Post: ${session.postId}` : 'Conversa Direta'
-      };
-      await saveOrderToDB(newMsgOrder);
-    } catch (dbError) {
-      console.error('⚠️ Erro ao guardar mensagem no modo silencioso:', dbError.message);
-    }
-    return;
-  }
-
-  if (session) {
-    if (session.state === 'AWAITING_SIZE_COLOR') {
-      session.orderData.sizeColor = messageText;
-      session.state = 'AWAITING_ADDRESS_CONTACT';
-      session.lastActive = Date.now();
-      
-      const reply = "Obrigado! 📝 Agora, por favor indica-nos a tua morada para envio (ou se preferes levantar na loja) e um número de telemóvel para contacto.";
-      await sendTextMessage(senderId, reply, accessToken);
-      return;
-    } 
-    
-    if (session.state === 'AWAITING_ADDRESS_CONTACT') {
-      session.orderData.addressContact = messageText;
-      
-      // Obter nome de perfil do utilizador para registar
-      const profile = await getUserProfile(senderId, accessToken);
-      const fullName = `${profile.first_name || 'Cliente'} ${profile.last_name || 'Messenger'}`.trim();
-      
-      // Formatar URL do post
-      const parts = session.postId.split('_');
-      const storyFbid = parts[1] || parts[0];
-      const pageIdVal = parts[0];
-      const postUrl = `https://www.facebook.com/permalink.php?story_fbid=${storyFbid}&id=${pageIdVal}`;
-      
-      // Construir mensagem final unificada
-      const consolidatedMessage = `[ENCOMENDA AUTOMÁTICA]\nArtigo: ${postUrl}\nDetalhes: ${session.orderData.sizeColor}\nContacto/Envio: ${messageText}`;
-      
-      const newOrder = {
-        id: 'o_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8),
-        name: fullName,
-        message: consolidatedMessage,
-        receivedAt: new Date().toISOString(),
-        conversationUrl: `https://business.facebook.com/latest/inbox/${senderId}`,
-        product: '',
-        status: 'pendente',
-        notes: `Artigo Post: ${session.postId}\nTamanho/Cor: ${session.orderData.sizeColor}\nContacto: ${messageText}`
-      };
-      
-      // Guardar na base de dados JSON
-      await saveOrderToDB(newOrder);
-      
-      // Limpar a sessão
-      sessions.delete(senderId);
-      
-      // Enviar mensagem de confirmação final
-      const reply = `Muito obrigado! A tua encomenda foi registada com sucesso com os seguintes dados:\n- Detalhes: ${session.orderData.sizeColor}\n- Contacto/Entrega: ${messageText}\n\nO pagamento pode ser efetuado por MB WAY ou levantamento físico na loja. Um operador irá validar a disponibilidade e enviar os detalhes de pagamento em breve. 🌸`;
-      await sendTextMessage(senderId, reply, accessToken);
+    if (text === lastFileContent) {
+      // No changes
+      setSyncBarText('✅ Actualizado — ' + formatTime(new Date().toISOString()));
+      if (notify) showToast('✅ Sem mensagens novas');
+      isSyncing = false;
       return;
     }
-  }
 
-  // Se não houver sessão ativa (conversação fora de fluxo ou início)
-  const intent = classifyMessengerMessage(messageText);
-  let replyText = "";
-  
-  switch (intent) {
-    case 'cobranca':
-      replyText = "Olá! Não fazemos envios à cobrança. Aceitamos pagamentos via MB WAY ou levantamento diretamente na loja física. Desejas fazer alguma encomenda?";
-      break;
-    case 'entrega':
-      replyText = "Olá! Fazemos entregas via CTT ou transportadora, sendo os portes calculados de acordo com o peso da encomenda. Também dispomos de levantamento gratuito na nossa loja física. Desejas encomendar algum artigo?";
-      break;
-    case 'saudacao':
-      replyText = "Olá! Como posso ajudar-te hoje? 😊 Se pretendes fazer uma encomenda, por favor partilha connosco o link ou a foto do artigo, indicando também o tamanho e a cor que pretendes. Desta forma daremos início ao pedido! 🌸";
-      break;
-    case 'sales':
-      replyText = "Olá! Se pretendes fazer uma encomenda ou saber o preço, por favor partilha connosco a foto ou link do artigo, e indica o tamanho e a cor que pretendes. Desta forma ajudamos-te muito mais rápido! 😊";
-      break;
-    default:
-      replyText = "Olá! Obrigado pela mensagem. Se pretendes fazer uma encomenda, por favor envia-nos o link ou foto do artigo, juntamente com o tamanho e a cor pretendidos. Um operador irá responder-te o mais breve possível. 🌸";
-      break;
-  }
-  
-  await sendTextMessage(senderId, replyText, accessToken);
+    lastFileContent = text;
+    const { newOrders, newReview } = processFileContent(text);
 
-  // Guardar a mensagem não-encomenda na base de dados para triagem (será colocada em "Para Rever" na PWA)
-  try {
-    const profile = await getUserProfile(senderId, accessToken);
-    const fullName = `${profile.first_name || 'Cliente'} ${profile.last_name || 'Messenger'}`.trim();
-    
-    const newMsgOrder = {
-      id: 'o_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8),
-      name: fullName,
-      message: messageText,
-      receivedAt: new Date().toISOString(),
-      conversationUrl: `https://business.facebook.com/latest/inbox/${senderId}`,
-      product: '',
-      status: 'pendente',
-      notes: `Intenção detetada: ${intent}`
+    const total = newOrders + newReview;
+    setSyncBarText(`✅ Última sync: ${formatTime(new Date().toISOString())}`);
+
+    if (total > 0) {
+      showSyncBarNew(`+${newOrders} encomenda${newOrders !== 1 ? 's' : ''}, +${newReview} a rever`);
+      if (newOrders > 0) {
+        showToast(`📦 ${newOrders} nova${newOrders !== 1 ? 's' : ''} encomenda${newOrders !== 1 ? 's' : ''} detectada${newOrders !== 1 ? 's' : ''}!`);
+        // Browser notification if supported
+        requestNotification(newOrders);
+      }
+      renderAll();
+    } else if (notify) {
+      showToast('✅ Sem mensagens novas');
+    }
+    renderSyncConnectedUI();
+  } catch (e) {
+    setSyncBarText('❌ Erro de leitura — verifique o ficheiro');
+    if (notify) showToast('❌ Erro ao ler ficheiro: ' + e.message);
+  }
+  isSyncing = false;
+}
+
+// ─────────────────────────────────────────────
+// PROCESS FILE CONTENT (JSONL or JSON array)
+// ─────────────────────────────────────────────
+function processFileContent(text) {
+  const items = parseFileContent(text);
+  const existingKeys = new Set([...orders, ...reviewQueue].map(dedupKey));
+
+  let newOrders = 0;
+  let newReview = 0;
+
+  for (const item of items) {
+    const name    = (item.name || item.not_title || '').trim();
+    const message = (item.message || item.not_text || item.text || item.body || '').trim();
+    const time    = item.receivedAt || item.timestamp || item.time || new Date().toISOString();
+    const url     = item.conversationUrl || item.url || '';
+
+    if (!name && !message) continue;
+
+    const obj = {
+      id:              genId(),
+      name:            name || 'Desconhecido',
+      message,
+      receivedAt:      normaliseTime(time),
+      conversationUrl: url,
+      product:         item.product || '',
+      importedAt:      new Date().toISOString()
     };
-    await saveOrderToDB(newMsgOrder);
-  } catch (dbError) {
-    console.error('⚠️ Erro ao salvar mensagem não-encomenda na base de dados:', dbError.message);
+
+    const key = dedupKey(obj);
+    if (existingKeys.has(key)) continue;
+    existingKeys.add(key);
+
+    syncStats.total = (syncStats.total || 0) + 1;
+
+    if (isOrderMessage(message)) {
+      addOrderObj(obj);
+      newOrders++;
+      syncStats.orders = (syncStats.orders || 0) + 1;
+    } else {
+      reviewQueue.push(obj);
+      newReview++;
+      syncStats.review = (syncStats.review || 0) + 1;
+    }
+  }
+
+  saveData();
+  return { newOrders, newReview };
+}
+
+function parseFileContent(text) {
+  if (!text.trim()) return [];
+
+  // Try as JSON array first
+  if (text.trim().startsWith('[')) {
+    try { return JSON.parse(text.trim()); } catch {}
+  }
+
+  // Try JSONL (one JSON object per line)
+  const items = [];
+  const lines = text.trim().split('\n');
+  for (const line of lines) {
+    const l = line.trim();
+    if (!l || !l.startsWith('{')) continue;
+    try { items.push(JSON.parse(l)); } catch {}
+  }
+  return items;
+}
+
+// ─────────────────────────────────────────────
+// KEYWORD DETECTION
+// ─────────────────────────────────────────────
+function isOrderMessage(message) {
+  if (!keywords.length) return true; // No filter → accept all
+  const lower = (message || '').toLowerCase();
+  return keywords.some(kw => lower.includes(kw.toLowerCase()));
+}
+
+// ─────────────────────────────────────────────
+// KEYWORD MANAGEMENT UI
+// ─────────────────────────────────────────────
+function renderKeywords() {
+  const wrap = document.getElementById('keywords-wrap');
+  if (!wrap) return;
+  wrap.innerHTML = keywords.map((kw, i) => `
+    <span class="kw-tag">
+      ${esc(kw)}
+      <button onclick="removeKeyword(${i})" title="Remover">×</button>
+    </span>
+  `).join('');
+}
+
+function addKeyword() {
+  const input = document.getElementById('new-keyword');
+  const val   = (input?.value || '').trim().toLowerCase();
+  if (!val) return;
+  if (keywords.includes(val)) { showToast('⚠️ Palavra-chave já existe'); return; }
+  keywords.push(val);
+  saveData();
+  renderKeywords();
+  input.value = '';
+  showToast(`✅ "${val}" adicionada`);
+}
+
+function removeKeyword(i) {
+  keywords.splice(i, 1);
+  saveData();
+  renderKeywords();
+}
+
+function resetKeywords() {
+  keywords = [...DEFAULT_KEYWORDS];
+  saveData();
+  renderKeywords();
+  showToast('↩️ Palavras-chave repostas');
+}
+
+// ─────────────────────────────────────────────
+// SYNC UI
+// ─────────────────────────────────────────────
+function updateSyncUI() {
+  const fileConnected = !!fileHandle;
+  const serverConnected = isServerSyncEnabled;
+  const dot   = document.getElementById('sync-dot');
+  const label = document.getElementById('sync-label');
+  const bar   = document.getElementById('sync-bar');
+
+  const isConnected = fileConnected || serverConnected;
+  if (dot)   dot.classList.toggle('sync-dot-active', isConnected);
+  
+  if (label) {
+    if (fileConnected && serverConnected) {
+      label.textContent = 'Auto-Sync + Chatbot';
+    } else if (fileConnected) {
+      label.textContent = 'Auto-Sync ON';
+    } else if (serverConnected) {
+      label.textContent = 'Chatbot ON';
+    } else {
+      label.textContent = 'Desligado';
+    }
+  }
+  if (bar)   bar.style.display = isConnected ? 'flex' : 'none';
+}
+
+function setSyncBarText(text) {
+  const el = document.getElementById('sync-bar-text');
+  if (el) el.textContent = text;
+}
+
+function showSyncBarNew(text) {
+  const el = document.getElementById('sync-bar-new');
+  if (!el) return;
+  el.textContent = text;
+  el.style.display = 'inline';
+  setTimeout(() => { el.style.display = 'none'; }, 8000);
+}
+
+function renderSyncConnectedUI() {
+  const connected = !!fileHandle;
+  const disc = document.getElementById('sync-disconnected-ui');
+  const conn = document.getElementById('sync-connected-ui');
+  if (disc) disc.style.display = connected ? 'none' : 'block';
+  if (conn) conn.style.display = connected ? 'block' : 'none';
+
+  if (connected) {
+    setText('sync-file-name', fileHandle.name || localStorage.getItem(K_FNAME) || '—');
+    setText('sync-last-sync', 'Activo — sync a cada 30 segundos');
+    setText('ss-total',  syncStats.total  || 0);
+    setText('ss-orders', syncStats.orders || 0);
+    setText('ss-review', syncStats.review || 0);
+  }
+
+  const badge = document.getElementById('sync-status-badge');
+  const btext = document.getElementById('sync-status-text');
+  if (badge) badge.className = 'sync-status-badge ' + (connected ? 'connected' : '');
+  if (btext) btext.textContent = connected ? '🟢 Conectado' : '🔴 Desligado';
+}
+
+// ─────────────────────────────────────────────
+// BROWSER NOTIFICATIONS
+// ─────────────────────────────────────────────
+function requestNotification(count) {
+  if (!('Notification' in window)) return;
+  const send = () => {
+    try {
+      new Notification('📦 Encomendas Messenger', {
+        body: `${count} nova${count !== 1 ? 's' : ''} encomenda${count !== 1 ? 's' : ''} detectada${count !== 1 ? 's' : ''}!`,
+        icon: 'data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><text y=".9em" font-size="56">📦</text></svg>',
+        tag: 'encomendas-sync',
+        renotify: true
+      });
+    } catch {}
+  };
+  if (Notification.permission === 'granted') send();
+  else if (Notification.permission !== 'denied') {
+    Notification.requestPermission().then(p => { if (p === 'granted') send(); });
   }
 }
 
-/* ─────────────────────────────────────────────
-   ROTAS DA API (Para integração com a PWA)
-   ───────────────────────────────────────────── */
+// ─────────────────────────────────────────────
+// STATUS MANAGEMENT
+// ─────────────────────────────────────────────
+function setStatus(id, status) {
+  const o = orders.find(x => x.id === id);
+  if (!o) return;
+  o.status    = status;
+  o.updatedAt = new Date().toISOString();
+  saveData();
+  renderAll();
+  const msgs = { pendente:'↩️ Reaberta', analise:'🔵 Em análise', confirmada:'✅ Confirmada!', 'sem-stock':'❌ Sem stock' };
+  showToast(msgs[status] || 'Estado actualizado');
+}
 
-// Endpoint para a PWA ler todas as encomendas registadas
-app.get('/api/orders', (req, res) => {
-  const orders = readOrdersFromDB();
-  res.json(orders);
+function quickConfirm(id) {
+  setStatus(id, 'confirmada');
+  openReplyModal(id, 'confirm');
+}
+
+function quickNoStock(id) {
+  setStatus(id, 'sem-stock');
+  openReplyModal(id, 'nostock');
+}
+
+// ─────────────────────────────────────────────
+// REPLY MODAL
+// ─────────────────────────────────────────────
+function openReplyModal(id, type) {
+  currentReplyId = id;
+  setReplyType(type || 'confirm');
+  document.getElementById('reply-status-change').value = '';
+  openModal('modal-reply');
+}
+
+function setReplyType(type) {
+  document.querySelectorAll('.reply-type-btn').forEach(b => b.classList.remove('active'));
+  const btn = document.getElementById('rtype-' + type);
+  if (btn) btn.classList.add('active');
+
+  const map   = { confirm: 0, nostock: 1, info: 2 };
+  const tpl   = templates[map[type]] || templates[0];
+  const o     = orders.find(x => x.id === currentReplyId) || reviewQueue.find(x => x.id === currentReplyId);
+  const fname = o ? o.name.split(' ')[0] : '';
+  const msg   = tpl ? tpl.text.replace(/\{nome\}/g, fname) : '';
+  document.getElementById('reply-text').value = msg;
+}
+
+function copyAndOpenMessenger() {
+  const text      = document.getElementById('reply-text').value.trim();
+  const newStatus = document.getElementById('reply-status-change').value;
+  if (!text) { showToast('⚠️ Escreva uma mensagem primeiro'); return; }
+
+  copyToClipboard(text, '📋 Mensagem copiada! Cole no Messenger.');
+  if (newStatus && currentReplyId) setStatus(currentReplyId, newStatus);
+
+  const o = orders.find(x => x.id === currentReplyId);
+  setTimeout(() => {
+    window.open(o?.conversationUrl || 'https://business.facebook.com/latest/inbox/', '_blank', 'noopener');
+  }, 400);
+  closeModal('modal-reply');
+}
+
+function openMessengerInbox() {
+  window.open('https://business.facebook.com/latest/inbox/', '_blank', 'noopener');
+}
+
+// ─────────────────────────────────────────────
+// NOTES MODAL
+// ─────────────────────────────────────────────
+function openNotesModal(id) {
+  const o = orders.find(x => x.id === id);
+  if (!o) return;
+  document.getElementById('notes-order-id').value = id;
+  document.getElementById('notes-text').value     = o.notes || '';
+  openModal('modal-notes');
+}
+
+function saveNotes() {
+  const id  = document.getElementById('notes-order-id').value;
+  const txt = document.getElementById('notes-text').value.trim();
+  const o   = orders.find(x => x.id === id);
+  if (!o) return;
+  o.notes = txt;
+  saveData();
+  renderAll();
+  closeModal('modal-notes');
+  showToast('📝 Nota guardada');
+}
+
+// ─────────────────────────────────────────────
+// DELETE
+// ─────────────────────────────────────────────
+function deleteOrder(id) {
+  const o = orders.find(x => x.id === id);
+  if (!o) return;
+  openConfirm('🗑️ Eliminar', `Eliminar encomenda de <strong>${esc(o.name)}</strong>?`, () => {
+    orders = orders.filter(x => x.id !== id);
+    saveData(); renderAll();
+    showToast('🗑️ Eliminada');
+  });
+}
+
+function confirmClearAll() {
+  openConfirm('⚠️ Limpar Tudo', `Eliminar TODAS as ${orders.length} encomendas e ${reviewQueue.length} mensagens para rever?`, () => {
+    orders = []; reviewQueue = []; orderCounter = 0; syncStats = {};
+    lastFileContent = '';
+    saveData(); renderAll();
+    showToast('🗑️ Tudo limpo');
+  });
+}
+
+// ─────────────────────────────────────────────
+// MANUAL ADD
+// ─────────────────────────────────────────────
+function addManual() {
+  const name = document.getElementById('m-name').value.trim();
+  const msg  = document.getElementById('m-msg').value.trim();
+  if (!name) { showToast('⚠️ Nome obrigatório'); return; }
+  if (!msg)  { showToast('⚠️ Mensagem obrigatória'); return; }
+
+  const timeVal = document.getElementById('m-time').value;
+  addOrderObj({
+    id:              genId(),
+    name,
+    message:         msg,
+    product:         document.getElementById('m-product').value.trim(),
+    conversationUrl: document.getElementById('m-url').value.trim(),
+    receivedAt:      timeVal ? new Date(timeVal).toISOString() : new Date().toISOString(),
+    importedAt:      new Date().toISOString()
+  });
+  saveData(); renderAll();
+  showToast(`✅ Encomenda de ${name} adicionada`);
+  ['m-name','m-msg','m-product','m-url'].forEach(id => { const el = document.getElementById(id); if (el) el.value = ''; });
+  setDefaultDateTime();
+}
+
+function addOrderObj(data) {
+  orderCounter++;
+  const o = {
+    ...data,
+    seq:    data.seq || orderCounter,
+    status: data.status || 'pendente',
+    notes:  data.notes  || ''
+  };
+  orders.push(o);
+  return o;
+}
+
+function setDefaultDateTime() {
+  const el = document.getElementById('m-time');
+  if (el) {
+    const now   = new Date();
+    el.value    = new Date(now - now.getTimezoneOffset() * 60000).toISOString().slice(0, 16);
+  }
+}
+
+// ─────────────────────────────────────────────
+// IMPORT FILE
+// ─────────────────────────────────────────────
+function handleFileDrop(e) {
+  e.preventDefault();
+  document.getElementById('json-drop')?.classList.remove('drag-over');
+  const file = e.dataTransfer.files[0];
+  if (file) readJsonFile(file);
+}
+
+function handleFileInput(e) {
+  const file = e.target.files[0];
+  if (file) readJsonFile(file);
+  e.target.value = '';
+}
+
+function readJsonFile(file) {
+  const reader = new FileReader();
+  reader.onload  = e => {
+    const { newOrders, newReview } = processFileContent(e.target.result);
+    showToast(newOrders > 0
+      ? `✅ ${newOrders} encomenda${newOrders !== 1 ? 's' : ''} importada${newOrders !== 1 ? 's' : ''}! (${newReview} para rever)`
+      : `⚠️ Sem encomendas novas. ${newReview} para rever.`
+    );
+    if (newOrders > 0) showSection('queue');
+    else if (newReview > 0) showSection('review');
+  };
+  reader.onerror = () => showToast('❌ Erro ao ler ficheiro');
+  reader.readAsText(file, 'UTF-8');
+}
+
+// ─────────────────────────────────────────────
+// EXPORT CSV
+// ─────────────────────────────────────────────
+function exportCSV() {
+  if (!orders.length) { showToast('⚠️ Sem encomendas para exportar'); return; }
+  const STATUS = { pendente:'Pendente', analise:'Em Análise', confirmada:'Confirmada', 'sem-stock':'Sem Stock' };
+  const rows   = [['Nº','Nome','Mensagem','Produto','Estado','Data/Hora','Notas']];
+  [...orders].sort((a, b) => a.seq - b.seq).forEach(o => rows.push([
+    '#' + String(o.seq).padStart(3,'0'),
+    o.name, o.message, o.product || '',
+    STATUS[o.status] || o.status,
+    formatTime(o.receivedAt), o.notes || ''
+  ]));
+  const csv  = rows.map(r => r.map(c => '"' + String(c).replace(/"/g, '""') + '"').join(',')).join('\r\n');
+  const blob = new Blob(['\uFEFF' + csv], { type: 'text/csv;charset=utf-8' });
+  const url  = URL.createObjectURL(blob);
+  const a    = Object.assign(document.createElement('a'), { href: url, download: `encomendas_${new Date().toISOString().slice(0,10)}.csv` });
+  a.click();
+  URL.revokeObjectURL(url);
+  showToast('⬇ CSV exportado!');
+}
+
+// ─────────────────────────────────────────────
+// TEMPLATES
+// ─────────────────────────────────────────────
+function defaultTemplates() {
+  return [
+    { id:'tpl1', icon:'✅', name:'Confirmação', text:'Olá {nome}! ✅ A sua encomenda foi confirmada e está em preparação.\n\nEm breve entraremos em contacto com os detalhes de entrega/levantamento.\n\nMuito obrigado pela preferência! 🙏' },
+    { id:'tpl2', icon:'❌', name:'Sem Stock',   text:'Olá {nome}, obrigado pelo contacto.\n\nInfelizmente o artigo que pediu encontra-se esgotado de momento. Assim que tivermos stock, entramos em contacto consigo.\n\nPedimos desculpa pelo inconveniente 🙏' },
+    { id:'tpl3', icon:'❓', name:'Mais Info',   text:'Olá {nome}! 😊 Obrigado pelo interesse.\n\nPoderia indicar-nos mais detalhes sobre a sua encomenda? (quantidade, cor, tamanho, etc.)\n\nAssim que recebermos essa informação, confirmamos de imediato. 🙏' }
+  ];
+}
+
+function renderTemplates() {
+  const list = document.getElementById('templates-list');
+  if (!list) return;
+  list.innerHTML = templates.map((t, i) => `
+    <div class="template-card">
+      <div class="template-header">
+        <span class="template-icon">${esc(t.icon || '💬')}</span>
+        <span class="template-name">${esc(t.name)}</span>
+      </div>
+      <div class="template-text">${esc(t.text)}</div>
+      <div class="template-actions">
+        <button class="btn btn-ghost btn-sm" onclick="openTemplateModal(${i})">✏️ Editar</button>
+        <button class="btn btn-ghost btn-sm" onclick="copyTemplate(${i})">📋 Copiar</button>
+        ${i >= 3 ? `<button class="btn btn-danger btn-sm" onclick="deleteTemplate(${i})">🗑️</button>` : ''}
+      </div>
+    </div>
+  `).join('');
+}
+
+function addTemplate() {
+  templates.push({ id: 'tpl_' + Date.now(), icon: '💬', name: 'Novo Template', text: 'Olá {nome}! ' });
+  saveData(); renderTemplates();
+  openTemplateModal(templates.length - 1);
+}
+
+function openTemplateModal(idx) {
+  const t = templates[idx]; if (!t) return;
+  document.getElementById('tpl-idx').value  = idx;
+  document.getElementById('tpl-name').value = t.name;
+  document.getElementById('tpl-icon').value = t.icon || '💬';
+  document.getElementById('tpl-text').value = t.text;
+  document.getElementById('tpl-modal-title').textContent = '✏️ ' + t.name;
+  openModal('modal-template');
+}
+
+function saveTemplate() {
+  const idx  = parseInt(document.getElementById('tpl-idx').value, 10);
+  const name = document.getElementById('tpl-name').value.trim();
+  const icon = document.getElementById('tpl-icon').value.trim() || '💬';
+  const text = document.getElementById('tpl-text').value.trim();
+  if (!name || !text) { showToast('⚠️ Nome e texto obrigatórios'); return; }
+  if (templates[idx]) { templates[idx] = { ...templates[idx], name, icon, text }; }
+  saveData(); renderTemplates();
+  closeModal('modal-template');
+  showToast('💾 Template guardado');
+}
+
+function deleteTemplate(idx) {
+  if (idx < 3) return;
+  templates.splice(idx, 1);
+  saveData(); renderTemplates();
+  showToast('🗑️ Template eliminado');
+}
+
+function copyTemplate(idx) {
+  const t = templates[idx]; if (!t) return;
+  copyToClipboard(t.text, '📋 Template copiado!');
+}
+
+// ─────────────────────────────────────────────
+// MACRODROID TEMPLATE COPY
+// ─────────────────────────────────────────────
+function copyMacroTemplate() {
+  const tmpl = `\n{"name":"{not_title}","message":"{not_text}","receivedAt":"{year}-{month}-{day}T{hour}:{mins}:{secs}.000Z"}`;
+  copyToClipboard(tmpl, '📋 Template do MacroDroid copiado!');
+}
+
+// ─────────────────────────────────────────────
+// BOOKMARKLET
+// ─────────────────────────────────────────────
+function buildBookmarkletLink() {
+  const code = `(function(){var items=[];var rows=document.querySelectorAll('[data-visualcompletion] [role="row"],.x1n2onr6[role="row"],[data-testid="MWV2ConversationItem"],li[class]');if(!rows.length)rows=document.querySelectorAll('li,[role="listitem"]');rows.forEach(function(el,i){var nm=el.querySelector('strong,b,[data-testid="conversation_name"],[aria-label]');var ms=el.querySelector('[data-testid="last_message_preview"],span[dir="auto"]');var tm=el.querySelector('abbr,time,[data-testid="timestamp"]');var lk=el.querySelector('a[href*="messages"],a[href*="inbox"],a[href]');if(!nm||!nm.textContent.trim())return;items.push({name:nm.textContent.trim(),message:ms?ms.textContent.trim():'',receivedAt:tm?(tm.getAttribute('data-utime')?new Date(parseInt(tm.getAttribute('data-utime'))*1000).toISOString():tm.getAttribute('datetime')||new Date().toISOString()):new Date().toISOString(),conversationUrl:lk?lk.href:'',importedAt:new Date().toISOString()});});if(!items.length){alert('Não foram encontradas conversas.\\nAbra: business.facebook.com/latest/inbox/');return;}var blob=new Blob([JSON.stringify(items,null,2)],{type:'application/json'});var url=URL.createObjectURL(blob);var a=document.createElement('a');a.href=url;a.download='orders_import.json';a.click();URL.revokeObjectURL(url);alert('✅ '+items.length+' conversa(s) exportada(s)!');})();`;
+  const href = 'javascript:' + encodeURIComponent(code);
+  const link = document.getElementById('bookmarklet-link');
+  if (link) link.href = href;
+  window._bmCode = href;
+}
+
+function copyBookmarkletCode() {
+  copyToClipboard(window._bmCode || '', '📋 Código copiado! Crie um favorito e cole no campo URL.');
+}
+
+// ─────────────────────────────────────────────
+// MODALS
+// ─────────────────────────────────────────────
+function openModal(id)  { document.getElementById(id)?.classList.add('open'); }
+function closeModal(id) { document.getElementById(id)?.classList.remove('open'); }
+
+let _confirmCb = null;
+function openConfirm(title, msg, cb) {
+  setText('confirm-title', title);
+  document.getElementById('confirm-msg').innerHTML = msg;
+  _confirmCb = cb;
+  const ok = document.getElementById('confirm-ok');
+  ok.onclick = () => { closeModal('modal-confirm'); _confirmCb?.(); _confirmCb = null; };
+  openModal('modal-confirm');
+}
+
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') document.querySelectorAll('.modal-overlay.open').forEach(m => m.classList.remove('open'));
 });
 
-// Endpoint para a PWA apagar/atualizar encomendas
-app.delete('/api/orders/:id', (req, res) => {
-  const { id } = req.params;
-  const orders = readOrdersFromDB();
-  const filtered = orders.filter(o => o.id !== id);
+// ─────────────────────────────────────────────
+// TOAST
+// ─────────────────────────────────────────────
+let _toastTimer = null;
+function showToast(msg) {
+  const el = document.getElementById('toast');
+  el.textContent = msg;
+  el.classList.add('show');
+  if (_toastTimer) clearTimeout(_toastTimer);
+  _toastTimer = setTimeout(() => el.classList.remove('show'), 3500);
+}
+
+// ─────────────────────────────────────────────
+// UTILITIES
+// ─────────────────────────────────────────────
+function esc(s) {
+  return String(s || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
+}
+function escRegex(s) { return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
+function setText(id, val) { const el = document.getElementById(id); if (el) el.textContent = val; }
+function genId() { return 'o_' + Date.now() + '_' + Math.random().toString(36).slice(2,8); }
+function dedupKey(o) { return ((o.name||'') + '::' + (o.message||'').slice(0,50)).toLowerCase().trim(); }
+
+function normaliseTime(t) {
+  if (!t) return new Date().toISOString();
+  if (/^\d{10}$/.test(String(t))) return new Date(Number(t) * 1000).toISOString();
+  if (/^\d{13}$/.test(String(t))) return new Date(Number(t)).toISOString();
+  const d = new Date(t);
+  return isNaN(d) ? new Date().toISOString() : d.toISOString();
+}
+
+function formatTime(iso) {
+  if (!iso) return '—';
+  const d = new Date(iso); if (isNaN(d)) return iso;
+  const now   = new Date();
+  const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  const dDay  = new Date(d.getFullYear(),   d.getMonth(),   d.getDate());
+  const diff  = (today - dDay) / 86400000;
+  const time  = d.toLocaleTimeString('pt-PT', { hour:'2-digit', minute:'2-digit' });
+  if (diff === 0) return `Hoje às ${time}`;
+  if (diff === 1) return `Ontem às ${time}`;
+  return d.toLocaleDateString('pt-PT', { day:'2-digit', month:'2-digit', year:'2-digit' }) + ' ' + time;
+}
+
+function copyToClipboard(text, msg) {
+  navigator.clipboard.writeText(text).then(() => showToast(msg)).catch(() => {
+    const el = Object.assign(document.createElement('textarea'), { value: text });
+    el.style.cssText = 'position:fixed;opacity:0';
+    document.body.appendChild(el); el.select(); document.execCommand('copy');
+    document.body.removeChild(el); showToast(msg);
+  });
+}
+
+// ─────────────────────────────────────────────
+// CHATBOT SERVER SYNC INTEGRATION
+// ─────────────────────────────────────────────
+
+function initServerSync() {
+  const input = document.getElementById('server-api-url');
+  if (input) input.value = serverApiUrl;
   
-  if (orders.length === filtered.length) {
-    return res.status(404).json({ error: 'Encomenda não encontrada' });
+  updateServerSyncUI();
+  if (isServerSyncEnabled) {
+    startServerSyncLoop();
   }
-  
-  writeOrdersToDB(filtered);
-  console.log(`🗑️ Encomenda ${id} apagada via API.`);
-  res.json({ success: true });
-});
+}
 
+function startServerSyncLoop() {
+  if (serverSyncTimer) clearInterval(serverSyncTimer);
+  // Primeira sync imediata
+  syncWithServer();
+  // Repetir de 30 em 30 segundos
+  serverSyncTimer = setInterval(syncWithServer, 30000);
+}
 
-/* ─────────────────────────────────────────────
-   GET /webhook (Validação do Facebook)
-   ───────────────────────────────────────────── */
-app.get('/webhook', (req, res) => {
-  const mode = req.query['hub.mode'];
-  const token = req.query['hub.verify_token'];
-  const challenge = req.query['hub.challenge'];
-
-  if (mode && token) {
-    if (mode === 'subscribe' && token === VERIFY_TOKEN) {
-      console.log('✅ Webhook verificado com sucesso pelo Facebook!');
-      return res.status(200).send(challenge);
-    } else {
-      console.error('❌ Falha na verificação: Tokens não coincidem.');
-      return res.sendStatus(403);
-    }
+function stopServerSyncLoop() {
+  if (serverSyncTimer) {
+    clearInterval(serverSyncTimer);
+    serverSyncTimer = null;
   }
-  res.sendStatus(400);
-});
+}
 
-/* ─────────────────────────────────────────────
-   POST /webhook (Eventos de Comentários)
-   ───────────────────────────────────────────── */
-app.post('/webhook', async (req, res) => {
-  console.log('📥 Recebido evento Webhook do Facebook!');
-  console.log(JSON.stringify(req.body, null, 2));
-
-  const body = req.body;
-
-  // Confirmar que o evento é de uma Página de Facebook
-  if (body.object === 'page') {
-    
-    // Facebook pode enviar múltiplos eventos num único lote
-    body.entry.forEach(entry => {
-      const pageId = entry.id; // O ID da nossa página
-
-      // --- 2.1. LÓGICA DE COMENTÁRIOS (Feed da Página) ---
-      if (entry.changes) {
-        entry.changes.forEach(async (change) => {
-        // Apenas nos interessam alterações no feed da página
-        if (change.field !== 'feed') return;
-
-        const value = change.value;
-        
-        // Verificar se é um novo comentário a ser adicionado
-        if (value.item === 'comment' && value.verb === 'add') {
-          const commentId = value.comment_id;
-          const message = value.message;
-          const senderId = value.from ? value.from.id : null;
-          const senderName = value.from ? value.from.name : 'Cliente';
-          const parentId = value.parent_id;
-          const postId = value.post_id;
-
-          console.log(`\n💬 Novo comentário detetado!`);
-          console.log(`- De: ${senderName} (ID: ${senderId})`);
-          console.log(`- Conteúdo: "${message}"`);
-          console.log(`- ID Comentário: ${commentId}`);
-
-          // 1. Evitar loops: Não responder se o comentário foi feito pela própria página
-          if (senderId === pageId) {
-            console.log('ℹ️ Comentário feito pela própria página. A ignorar para evitar loops.');
-            return;
-          }
-
-          // 2. Apenas responder a comentários de nível principal (ignorar respostas a comentários)
-          // Se parent_id existir e for diferente do post_id, significa que é uma resposta a outro comentário
-          if (parentId && parentId !== postId) {
-            console.log('ℹ️ É uma resposta a outro comentário. A ignorar para evitar spam.');
-            return;
-          }
-
-          // Colocar um Like no comentário para mostrar que foi lido (aplicável a todos os comentários de clientes, incluindo diretos e avisos)
-          await likeComment(commentId, PAGE_ACCESS_TOKEN);
-
-          // 3. Gerar a resposta personalizada com base no conteúdo do comentário
-          const classification = classifyCommentAndGetReply(message, senderName);
-          const isShippingOrCobranca = classification.type === 'entrega' || classification.type === 'cobranca';
-
-          // Se não for uma pergunta sobre envios ou cobranças, aplicamos os filtros de exclusão (diretos e avisos)
-          if (!isShippingOrCobranca) {
-            // 2.1. Ignorar comentários se o post for um direto de vídeo ATIVO (LIVE)
-            console.log(`🔍 A verificar se o post ${postId} é um direto ativo...`);
-            const isLive = await isPostCurrentlyLive(postId, PAGE_ACCESS_TOKEN);
-            if (isLive) {
-              console.log('ℹ️ Comentário (não envios/cobrança) feito num direto ativo (LIVE). Nenhuma resposta automática enviada.');
-              return;
-            }
-
-            // 2.2. Ignorar comentários se o post contiver palavras de exclusão (direto, aviso, comunicado, etc.)
-            console.log(`🔍 A verificar se o post ${postId} contém palavras de exclusão no texto...`);
-            const postText = await getPostMessage(postId, PAGE_ACCESS_TOKEN);
-            if (postText) {
-              const hasExclusion = hasExclusionWord(postText);
-              if (hasExclusion) {
-                console.log(`ℹ️ Post ignorado por conter palavra de exclusão (direto, aviso, comunicado, etc.). Conteúdo: "${postText.substring(0, 100)}..."`);
-                return;
-              }
-            }
-          } else {
-            console.log(`ℹ️ Pergunta de envios/cobrança detetada ("${classification.type}"). Ignorando filtros de exclusão e diretos para responder.`);
-          }
-
-          let replyText = classification.text;
-
-          // Gerar o link m.me correspondente
-          try {
-            const PAGE_USERNAME = process.env.PAGE_USERNAME || 'BySandraSilveira';
-            let mmeLink = '';
-
-            if (classification.isSales) {
-              // Link especializado com referência do post e texto pré-preenchido
-              const prefilledText = 'Olá! Quero encomendar este artigo.';
-              const encodedText = encodeURIComponent(prefilledText);
-              mmeLink = `https://m.me/${PAGE_USERNAME}?ref=${postId}&text=${encodedText}`;
-            } else {
-              // Link básico do Messenger da página, sem indicação do artigo
-              mmeLink = `https://m.me/${PAGE_USERNAME}`;
-            }
-
-            if (replyText.includes('{link}')) {
-              replyText = replyText.replace('{link}', mmeLink);
-            } else {
-              replyText = `${replyText}\n\n👉 Fala connosco: ${mmeLink}`;
-            }
-          } catch (linkError) {
-            console.error('[LINK GENERATOR] Erro ao gerar link personalizado:', linkError.message);
-          }
-
-          // 4. Enviar a resposta via API Graph do Facebook
-          try {
-            console.log(`✈️ A enviar resposta pública para o comentário ${commentId}...`);
-            
-            const response = await axios.post(
-              `https://graph.facebook.com/v19.0/${commentId}/comments`,
-              { message: replyText },
-              { params: { access_token: PAGE_ACCESS_TOKEN } }
-            );
-
-            console.log(`✅ Resposta enviada! ID da Resposta: ${response.data.id}`);
-          } catch (error) {
-            console.error('❌ Erro ao enviar resposta para o Facebook:');
-            if (error.response && error.response.data) {
-              console.error(JSON.stringify(error.response.data, null, 2));
-            } else {
-              console.error(error.message);
-            }
-          }
-        }
-        });
-      }
-
-      // --- 2.2. LÓGICA DE ATENDIMENTO AUTOMÁTICO (Chatbot do Messenger) ---
-      if (entry.messaging) {
-        entry.messaging.forEach(async (messagingEvent) => {
-          console.log(`📥 [MESSAGING] Recebido evento no Messenger:`, JSON.stringify(messagingEvent, null, 2));
-          const senderId = messagingEvent.sender ? messagingEvent.sender.id : null;
-          if (!senderId) return;
-
-          // 1. Ignorar mensagens eco (mensagens enviadas pela própria página)
-          if (messagingEvent.message && messagingEvent.message.is_echo) {
-            console.log('ℹ️ [MESSAGING] Mensagem eco (enviada pela página). A ignorar.');
-            return;
-          }
-
-          // 2. Verificar se há uma referência (referral) de link m.me no evento
-          let ref = null;
-          if (messagingEvent.referral && messagingEvent.referral.ref) {
-            ref = messagingEvent.referral.ref;
-          } else if (messagingEvent.postback && messagingEvent.postback.referral && messagingEvent.postback.referral.ref) {
-            ref = messagingEvent.postback.referral.ref;
-          } else if (messagingEvent.message && messagingEvent.message.referral && messagingEvent.message.referral.ref) {
-            ref = messagingEvent.message.referral.ref;
-          }
-
-          if (ref) {
-            console.log(`\n💬 Novo cliente entrou via link de referência no Messenger!`);
-            console.log(`- Cliente PSID: ${senderId}`);
-            console.log(`- ID do Post de Referência: ${ref}`);
-
-            // Inicializar sessão conversacional para este utilizador
-            sessions.set(senderId, {
-              state: 'AWAITING_SIZE_COLOR',
-              postId: ref,
-              orderData: { sizeColor: '', addressContact: '' },
-              lastActive: Date.now()
-            });
-
-            // Enviar imagem e solicitar cor/tamanho
-            await handleMessengerReferral(senderId, ref, PAGE_ACCESS_TOKEN);
-          } else if (messagingEvent.message && messagingEvent.message.text) {
-            // Mensagem de texto normal do utilizador
-            const messageText = messagingEvent.message.text.trim();
-            await handleDirectMessage(senderId, messageText, PAGE_ACCESS_TOKEN);
-          }
-        });
-      }
-    });
-
-    // Responder ao Facebook com 200 OK para confirmar receção do evento
-    return res.status(200).send('EVENT_RECEIVED');
-  }
-
-  // Se não for um objeto de página
-  res.sendStatus(404);
-});
-
-// Rota padrão para teste rápido
-app.get('/', (req, res) => {
-  res.send('🤖 Facebook Comment Bot está a funcionar localmente!');
-});
-
-/* ─────────────────────────────────────────────
-   FUNÇÃO AUXILIAR: Subscrever Página de Forma Automática
-   ───────────────────────────────────────────── */
-async function autoSubscribePage() {
-  if (!PAGE_ACCESS_TOKEN || PAGE_ACCESS_TOKEN === 'O_TEU_PAGE_ACCESS_TOKEN_AQUI') {
-    console.log('ℹ️ [AUTO-SUBSCRIBE] Token de página não configurado ou padrão. A ignorar auto-subscrição.');
+function connectServerSync() {
+  const input = document.getElementById('server-api-url');
+  const url = (input?.value || '').trim();
+  if (!url) {
+    showToast('⚠️ Introduza um URL de servidor válido.');
     return;
   }
-  try {
-    console.log('🔗 [AUTO-SUBSCRIBE] A tentar subscrever a página na aplicação da Meta...');
-    const response = await axios.post(
-      `https://graph.facebook.com/v19.0/me/subscribed_apps`,
-      null,
-      {
-        params: {
-          subscribed_fields: 'feed,messages,messaging_postbacks,messaging_referrals',
-          access_token: PAGE_ACCESS_TOKEN
-        }
-      }
-    );
-    if (response.data && response.data.success) {
-      console.log('✅ [AUTO-SUBSCRIBE] Página subscrita com sucesso para: feed, messages, messaging_postbacks, messaging_referrals!');
-    } else {
-      console.log('⚠️ [AUTO-SUBSCRIBE] Resposta inesperada ao subscrever:', response.data);
-    }
-  } catch (error) {
-    console.error('❌ [AUTO-SUBSCRIBE] Erro ao subscrever página de forma automática:');
-    if (error.response && error.response.data) {
-      console.error(JSON.stringify(error.response.data, null, 2));
-    } else {
-      console.error(error.message);
-    }
+  
+  serverApiUrl = url;
+  isServerSyncEnabled = true;
+  saveData();
+  
+  updateServerSyncUI();
+  updateSyncUI();
+  startServerSyncLoop();
+  showToast('🟢 Sincronização com o Chatbot activada!');
+}
+
+function disconnectServerSync() {
+  isServerSyncEnabled = false;
+  saveData();
+  stopServerSyncLoop();
+  updateServerSyncUI();
+  updateSyncUI();
+  showToast('🔌 Sincronização com o Chatbot desactivada');
+}
+
+function updateServerSyncUI() {
+  const dot = document.getElementById('server-sync-dot');
+  const text = document.getElementById('server-status-text');
+  const badge = document.getElementById('server-status-badge');
+  
+  if (isServerSyncEnabled) {
+    if (dot) dot.classList.add('sync-dot-active');
+    if (text) text.textContent = '🟢 Ligado';
+    if (badge) badge.className = 'sync-status-badge connected';
+  } else {
+    if (dot) dot.classList.remove('sync-dot-active');
+    if (text) text.textContent = '🔴 Desligado';
+    if (badge) badge.className = 'sync-status-badge';
   }
 }
 
-/* ─────────────────────────────────────────────
-   INICIAR SERVIDOR
-   ───────────────────────────────────────────── */
-app.listen(PORT, async () => {
-  console.log(`\n🚀 Servidor do Bot iniciado com sucesso na porta ${PORT}`);
-  console.log(`- Webhook URL local: http://localhost:${PORT}/webhook`);
-  console.log(`- Monitorizando comentários no feed da página...`);
+function setServerSyncStatus(success, message) {
+  const text = document.getElementById('server-status-text');
+  const dot = document.getElementById('server-sync-dot');
+  const badge = document.getElementById('server-status-badge');
   
-  // Subscrever a página automaticamente às permissões de webhook
-  await autoSubscribePage();
-});
+  if (text) text.textContent = success ? message : `❌ ${message}`;
+  if (dot) {
+    if (success) dot.classList.add('sync-dot-active');
+    else dot.classList.remove('sync-dot-active');
+  }
+  if (badge) {
+    badge.className = 'sync-status-badge ' + (success ? 'connected' : '');
+  }
+}
+
+async function syncWithServer() {
+  if (!isServerSyncEnabled || !serverApiUrl) return;
+  
+  try {
+    const response = await fetch(`${serverApiUrl}/api/orders?_=${Date.now()}`, { cache: 'no-store' });
+    if (!response.ok) throw new Error('Falha na resposta do servidor');
+    
+    const serverOrders = await response.json();
+    if (!Array.isArray(serverOrders)) throw new Error('Dados inválidos recebidos');
+    
+    let newImported = 0;
+    const existingKeys = new Set([...orders, ...reviewQueue].map(dedupKey));
+    const existingIds = new Set([...orders, ...reviewQueue].map(o => o.id));
+    
+    for (const item of serverOrders) {
+      const key = dedupKey(item);
+      if (existingKeys.has(key) || existingIds.has(item.id)) {
+        // Já existe localmente, tentar limpar do servidor
+        await deleteOrderFromServer(item.id);
+        continue;
+      }
+      
+      const obj = {
+        id:              item.id,
+        name:            item.name,
+        message:         item.message,
+        receivedAt:      item.receivedAt,
+        conversationUrl: item.conversationUrl,
+        product:         item.product || '',
+        notes:           item.notes || '',
+        importedAt:      new Date().toISOString()
+      };
+
+      if (isOrderMessage(item.message)) {
+        addOrderObj(obj);
+      } else {
+        reviewQueue.push(obj);
+      }
+      
+      newImported++;
+      // Remover do servidor já que foi importado com sucesso
+      await deleteOrderFromServer(item.id);
+    }
+    
+    if (newImported > 0) {
+      showToast(`🌐 ${newImported} nova(s) encomenda(s) sincronizada(s) do chatbot!`);
+      saveData();
+      renderAll();
+    }
+    
+    setServerSyncStatus(true, `Ligado — Última sync: ${formatTime(new Date().toISOString())}`);
+  } catch (e) {
+    console.error('❌ Erro na sincronização com o chatbot:', e.message);
+    setServerSyncStatus(false, 'Erro de ligação');
+  }
+}
+
+async function deleteOrderFromServer(id) {
+  try {
+    await fetch(`${serverApiUrl}/api/orders/${id}`, { method: 'DELETE' });
+  } catch (e) {
+    console.warn(`⚠️ Não foi possível apagar a encomenda ${id} do servidor:`, e.message);
+  }
+}
