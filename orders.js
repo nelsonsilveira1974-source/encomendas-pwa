@@ -173,6 +173,7 @@ function updateStats() {
   setText('stat-review',    review);
   setText('stat-confirmed', confirmed);
   setText('stat-nostock',   noStock);
+  setText('stat-history',   orders.length);
 
   // Pending badge (queue nav)
   const pBadge = pending + analysis;

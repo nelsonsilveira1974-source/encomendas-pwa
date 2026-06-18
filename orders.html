@@ -75,21 +75,25 @@
 
     <!-- STATS -->
     <div class="stats-bar" id="stats-bar">
-      <div class="stat-pill pending">
+      <div class="stat-pill pending" onclick="showSection('queue'); setFilter('pendente');" title="Ver encomendas pendentes">
         <span class="stat-num" id="stat-pending">0</span>
         <span class="stat-lbl">🟡 Pendentes</span>
       </div>
-      <div class="stat-pill review-stat">
+      <div class="stat-pill review-stat" onclick="showSection('review');" title="Ver mensagens para rever">
         <span class="stat-num" id="stat-review">0</span>
         <span class="stat-lbl">🔎 Para rever</span>
       </div>
-      <div class="stat-pill confirmed">
+      <div class="stat-pill confirmed" onclick="showSection('queue'); setFilter('confirmada');" title="Ver encomendas confirmadas">
         <span class="stat-num" id="stat-confirmed">0</span>
         <span class="stat-lbl">🟢 Confirmadas</span>
       </div>
-      <div class="stat-pill no-stock">
+      <div class="stat-pill no-stock" onclick="showSection('queue'); setFilter('sem-stock');" title="Ver encomendas sem stock">
         <span class="stat-num" id="stat-nostock">0</span>
         <span class="stat-lbl">🔴 Sem stock</span>
+      </div>
+      <div class="stat-pill history-stat" onclick="showSection('history');" title="Ver todo o histórico">
+        <span class="stat-num" id="stat-history">0</span>
+        <span class="stat-lbl">📋 Histórico</span>
       </div>
     </div>
 

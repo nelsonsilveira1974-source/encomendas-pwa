@@ -3,7 +3,7 @@
    Cache-first para funcionar offline
    ============================================= */
 
-const CACHE_NAME = 'encomendas-v2';
+const CACHE_NAME = 'encomendas-v3';
 const ASSETS = [
   './orders.html',
   './orders.js',

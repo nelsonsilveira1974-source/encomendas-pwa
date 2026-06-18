@@ -223,6 +223,16 @@ body {
   padding: 8px 16px;
   white-space: nowrap;
   transition: var(--transition);
+  cursor: pointer;
+  user-select: none;
+}
+.stat-pill:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+  filter: brightness(1.1);
+}
+.stat-pill:active {
+  transform: translateY(0);
 }
 .stat-pill .stat-num { font-size: 20px; font-weight: 800; }
 .stat-pill .stat-lbl { font-size: 12px; color: var(--text-sec); font-weight: 500; }
@@ -230,10 +240,12 @@ body {
 .stat-pill.review   { border-color: var(--blue);    background: var(--blue-bg); }
 .stat-pill.confirmed{ border-color: var(--emerald); background: var(--emerald-bg); }
 .stat-pill.no-stock { border-color: var(--rose);    background: var(--rose-bg); }
+.stat-pill.history-stat { border-color: var(--indigo); background: rgba(99,102,241,0.12); }
 .stat-pill.pending  .stat-num { color: var(--amber); }
 .stat-pill.review   .stat-num { color: var(--blue); }
 .stat-pill.confirmed .stat-num { color: var(--emerald); }
 .stat-pill.no-stock .stat-num { color: var(--rose); }
+.stat-pill.history-stat .stat-num { color: var(--indigo); }
 
 /* ── Filter Tabs ───────────────────────────── */
 .filter-bar {
